@@ -1,0 +1,81 @@
+# =============================================================================
+#  阅后即焚 · P2P 私密聊天室 —— 一键部署
+#  ---------------------------------------------------------------------------
+#  0. 先定一个服务口令（不设也行，容器会随机生成并打在日志里）：
+#        export ACCESS_CODE='你的口令'         # Linux / macOS
+#        $env:ACCESS_CODE='你的口令'           # PowerShell
+#     也可以用同目录的 .env 文件写一行：ACCESS_CODE=你的口令
+#  1. 启动：docker compose up -d --build
+#  2. 查看：docker compose ps / docker compose logs -f
+#  3. 停止：docker compose down
+#  4. 访问：http://127.0.0.1:3001  —— 首页必须输入上面的口令才能用
+#
+#  端口只映射到宿主机回环地址 127.0.0.1:3001，
+#  外网访问请交给同机 Nginx 反代（见 nginx.conf.example），
+#  这样容器不会被直接暴露到公网。
+# =============================================================================
+services:
+  chatroom:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 国内网络可执行：NPM_REGISTRY=https://registry.npmmirror.com docker compose build
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
+    image: burn-chat:1.0.0
+    container_name: burn-chat
+    restart: unless-stopped
+
+    ports:
+      # 宿主机 3001 -> 容器 3000（只监听回环，配合 Nginx 反代）
+      - "127.0.0.1:3001:3000"
+
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOST: 0.0.0.0
+      # ---- 服务级访问口令：全站唯一的「暗号」，不写死在代码里 ----
+      # 留空则回退到 /app/access-code.txt，再没有就随机生成（见 docker compose logs）
+      ACCESS_CODE: ${ACCESS_CODE:-}
+      ACCESS_CODE_FILE: /app/access-code.txt
+
+    # 想用「文件放口令」的方式时，把下面两行取消注释：
+    #   宿主机 ./access-code.txt 里的第一行非空内容就是口令
+    # volumes:
+    #   - ./access-code.txt:/app/access-code.txt:ro
+
+    # ---- 运行时加固：应用不需要写磁盘，也不需要任何 capability ----
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # 进程数 / 文件句柄的软限制（可选，防止异常情况吃满宿主资源）
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # 日志轮转：聊天内容只在内存里，容器日志只有生命周期事件
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 信号直达 node，避免 CMD 被 shell 包裹后收不到 SIGTERM
+    init: true

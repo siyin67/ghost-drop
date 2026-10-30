@@ -1,0 +1,15 @@
+# 构建上下文瘦身：这些文件不该进镜像（尤其 cankao/ 里的参考项目）
+node_modules
+.npm-cache
+cankao
+screenshots
+.git
+.gitignore
+*.log
+.tmp-*
+compose.yaml
+nginx.conf.example
+README.md
+# 口令文件绝不进镜像（镜像层是永久的，密钥必须运行时挂载或走环境变量）
+access-code.txt
+.env

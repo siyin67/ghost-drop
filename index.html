@@ -1,0 +1,2406 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="h-full">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>阅后即焚 · P2P 私密聊天室</title>
+
+  <!-- 内联 SVG 图标：省一次请求，也避免控制台出现 /favicon.ico 404 -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%A5%3C/text%3E%3C/svg%3E" />
+
+  <!--
+    TailwindCSS（CDN 版，按需求引入；生产可换成构建产物）。
+    这里用「动态插入 + async」而不是同步 <script src>，原因是同步脚本会阻塞解析：
+    cdn.tailwindcss.com 一旦不可达或很慢（内网、墙、CDN 抖动），首屏会一直白屏，
+    连聊天都进不去。异步化之后页面先可用，样式晚一点点补上；彻底失败时给一条提示。
+  -->
+  <script>
+    (function () {
+      function showStyleFallback() {
+        if (document.getElementById('style-fallback')) return;
+        var bar = document.createElement('div');
+        bar.id = 'style-fallback';
+        bar.setAttribute('style', [
+          'position:fixed', 'left:0', 'right:0', 'bottom:0', 'z-index:60',
+          'padding:8px 12px', 'text-align:center',
+          'font:12px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif',
+          'background:#3b1d1d', 'color:#fecaca', 'border-top:1px solid #7f1d1d',
+        ].join(';'));
+        bar.textContent = '样式表（Tailwind CDN）加载失败：界面会退化成纯文本排版，聊天与文件传输功能不受影响。';
+        var mount = function () { document.body && document.body.appendChild(bar); };
+        if (document.body) mount();
+        else document.addEventListener('DOMContentLoaded', mount, { once: true });
+      }
+
+      var pending = document.createElement('script');
+      pending.src = 'https://cdn.tailwindcss.com';
+      pending.async = true;
+      var timer = setTimeout(showStyleFallback, 12000);
+      pending.onload = function () { clearTimeout(timer); };
+      pending.onerror = function () { clearTimeout(timer); showStyleFallback(); };
+      document.head.appendChild(pending);
+    })();
+  </script>
+
+  <style>
+    /* ------------------------------------------------------------------
+     * 少量原生 CSS：Tailwind 覆盖不到的滚动条、气泡动画与安全区适配
+     * ------------------------------------------------------------------ */
+    :root { color-scheme: dark; }
+
+    /*
+     * 兜底一条：Tailwind 是异步加载的，它到位之前 .hidden 还是个「无定义类名」，
+     * 页面会把本该隐藏的聊天界面、按钮统统画出来闪一下。
+     * 这条规则写在 Tailwind 注入的样式之前，所以不会盖掉 lg:flex 这类响应式覆盖
+     * （同优先级下，后出现的规则生效）。
+     */
+    .hidden { display: none; }
+
+    html, body { height: 100%; }
+    body {
+      background:
+        radial-gradient(1000px 600px at 12% -10%, rgba(99, 102, 241, .20), transparent 60%),
+        radial-gradient(900px 500px at 92% 8%, rgba(34, 211, 238, .14), transparent 55%),
+        radial-gradient(700px 500px at 50% 110%, rgba(168, 85, 247, .12), transparent 60%),
+        #070b16;
+    }
+
+    /* 细滚动条，避免默认滚动条破坏暗色观感 */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, .22); border-radius: 999px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, .38); }
+
+    textarea { resize: none; }
+
+    /* 消息入场动画：只作用于新追加的气泡 */
+    @keyframes bubble-in {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: none; }
+    }
+    .bubble-in { animation: bubble-in .18s ease-out both; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .bubble-in { animation: none; }
+    }
+
+    /* iOS 底部安全区 */
+    .safe-bottom { padding-bottom: max(.75rem, env(safe-area-inset-bottom)); }
+  </style>
+</head>
+
+<body class="h-full font-sans text-slate-100 antialiased">
+
+  <!-- ==================================================================
+       一、首页（模式 A：创建房间 / 模式 C：手动加入）
+       ================================================================== -->
+  <main id="view-home" class="mx-auto flex min-h-full w-full max-w-4xl flex-col justify-center gap-8 px-5 py-10">
+
+    <header class="text-center">
+      <div class="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.06] text-2xl shadow-lg shadow-indigo-500/10">
+        🔥
+      </div>
+      <h1 class="text-2xl font-semibold tracking-tight text-white sm:text-3xl">阅后即焚 · 私密聊天室</h1>
+      <p class="mt-2 text-sm text-slate-400">
+        没有账号、没有数据库、没有云端留存。文件走 P2P 直连，服务器只帮忙递个眼色。
+      </p>
+    </header>
+
+    <!-- 我的昵称（localStorage 缓存，刷新不丢） -->
+    <section class="mx-auto flex w-full max-w-md items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3">
+      <div id="identity-avatar" class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-indigo-500/80 text-xs font-semibold text-white">我</div>
+      <div class="min-w-0 flex-1">
+        <label for="input-name" class="block text-[11px] uppercase tracking-wider text-slate-500">我的昵称</label>
+        <input id="input-name" type="text" maxlength="20" autocomplete="off" placeholder="给自己起个名字"
+               class="w-full bg-transparent text-sm text-slate-100 placeholder:text-slate-600 focus:outline-none" />
+      </div>
+      <span class="rounded-full bg-white/5 px-2 py-1 text-[10px] text-slate-500">仅本机保存</span>
+    </section>
+
+    <!-- ================================================================
+         入口闸门：先验服务口令，验对之后才出现「进入房间 / 创建房间」
+         ================================================================ -->
+    <section class="mx-auto w-full max-w-md rounded-2xl border border-white/10 bg-white/[0.03] p-5 backdrop-blur">
+
+      <div class="flex items-center gap-2">
+        <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-indigo-500/15 text-indigo-300">🔑</span>
+        <div class="min-w-0">
+          <h2 class="text-sm font-semibold text-white">服务口令</h2>
+          <p class="text-[11px] text-slate-500">必填。验对之后才能创建或进入房间</p>
+        </div>
+      </div>
+
+      <div class="relative mt-3">
+        <input id="input-access" type="password" maxlength="128" autocomplete="off" spellcheck="false"
+               placeholder="请输入服务口令"
+               class="w-full rounded-xl border border-white/10 bg-black/20 py-2.5 pl-3 pr-10 text-sm text-slate-100 placeholder:text-slate-600 focus:border-indigo-400/60 focus:outline-none focus:ring-2 focus:ring-indigo-500/20" />
+        <!-- 右侧对勾 / 叉号：纯视觉反馈，真正的判定在服务端 -->
+        <span id="access-mark" class="pointer-events-none absolute right-3 top-1/2 hidden -translate-y-1/2 text-sm leading-none"></span>
+      </div>
+      <p id="access-hint" class="mt-2 hidden text-[11px] leading-relaxed"></p>
+
+      <!-- 房间号：邀请链接已带入就显示成卡片，否则给一个输入框自己填 -->
+      <div id="room-id-row" class="mt-3 hidden">
+        <div id="room-chip" class="hidden items-center justify-between gap-3 rounded-xl border border-cyan-400/20 bg-cyan-400/5 px-3 py-2">
+          <span class="text-[11px] text-slate-400">邀请房间</span>
+          <span id="room-chip-id" class="truncate font-mono text-[13px] text-cyan-200"></span>
+        </div>
+        <input id="input-room" type="text" maxlength="32" autocomplete="off" spellcheck="false"
+               placeholder="房间号，例如 room_a1b2"
+               class="hidden w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-600 focus:border-cyan-400/60 focus:outline-none focus:ring-2 focus:ring-cyan-500/20" />
+      </div>
+
+      <!-- 只有口令验对之后，这两个按钮才会出现 -->
+      <div id="enter-actions" class="mt-4 hidden grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <button id="btn-enter" type="button"
+                class="rounded-xl border border-white/15 bg-white/[0.06] px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-white/[0.1] active:scale-[.99] disabled:opacity-60">
+          进入房间
+        </button>
+        <button id="btn-create" type="button"
+                class="rounded-xl bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-400 active:scale-[.99] disabled:opacity-60">
+          创建房间
+        </button>
+      </div>
+
+      <p class="mt-3 text-[11px] leading-relaxed text-slate-500">
+        口令只留在内存里，不写 localStorage：刷新或重开页面都要重新输入。
+        房间号会留在地址栏，方便把邀请链接直接发给对方。
+      </p>
+    </section>
+
+    <footer class="mx-auto max-w-md text-center text-[11px] leading-relaxed text-slate-600">
+      文件通过 WebRTC DataChannel 点对点传输，不经过服务器；<br class="hidden sm:block" />
+      传输中途任何一方关闭页面，连接即中断，符合「阅后即焚」的设计取舍。
+    </footer>
+  </main>
+
+  <!-- ==================================================================
+       二、聊天室（模式 A / B / C 进入后）
+       ================================================================== -->
+  <main id="view-chat" class="hidden h-[100dvh] w-full">
+    <div class="mx-auto flex h-full w-full max-w-6xl overflow-hidden border-white/5 bg-[#0b1020]/40 lg:border-x">
+
+      <!-- 侧边：在线人员 -->
+      <aside id="member-panel"
+             class="hidden w-64 shrink-0 flex-col border-r border-white/10 bg-[#0b1020]/50 backdrop-blur lg:static lg:z-auto lg:flex lg:shadow-none">
+        <div class="flex items-center justify-between px-4 py-3 text-[11px] uppercase tracking-wider text-slate-400">
+          <span>在线成员</span>
+          <span id="member-count" class="rounded-full bg-white/10 px-2 py-0.5 text-[10px] text-slate-200">0</span>
+        </div>
+        <ul id="member-list" class="flex-1 space-y-0.5 overflow-y-auto px-2 pb-3"></ul>
+        <div class="border-t border-white/10 p-3 text-[11px] leading-relaxed text-slate-500">
+          消息只存在服务器内存里，最多留 50 条；最后一人离开后整间房连同消息立即销毁。
+        </div>
+      </aside>
+
+      <!-- 右侧主列 -->
+      <section class="flex min-w-0 flex-1 flex-col">
+
+        <header class="flex items-center gap-2 border-b border-white/10 bg-[#0b1020]/60 px-3 py-3 backdrop-blur sm:px-4">
+          <button id="btn-members" type="button" aria-label="查看在线成员"
+                  class="rounded-lg border border-white/10 p-2 text-slate-300 hover:bg-white/5 lg:hidden">
+            👥
+          </button>
+          <div class="min-w-0 flex-1">
+            <h1 id="room-title" class="truncate text-sm font-semibold text-white">房间</h1>
+            <p id="room-subtitle" class="truncate text-[11px] text-slate-500">正在连接…</p>
+          </div>
+          <span id="conn-status"
+                class="hidden rounded-full border border-emerald-400/20 bg-emerald-400/10 px-2 py-1 text-[10px] text-emerald-300 sm:inline-flex">已连接</span>
+          <button id="btn-copy-link" type="button"
+                  class="rounded-lg border border-white/10 px-3 py-1.5 text-[12px] text-slate-200 transition hover:bg-white/5">
+            复制邀请
+          </button>
+          <button id="btn-leave" type="button"
+                  class="rounded-lg border border-rose-400/20 bg-rose-500/10 px-3 py-1.5 text-[12px] text-rose-300 transition hover:bg-rose-500/20">
+            离开
+          </button>
+        </header>
+
+        <!-- 消息列表 -->
+        <div id="message-list" class="flex-1 space-y-3 overflow-y-auto px-3 py-5 sm:px-5">
+          <div id="empty-state" class="mx-auto mt-10 max-w-sm rounded-2xl border border-dashed border-white/10 bg-white/[0.02] p-6 text-center">
+            <p class="text-sm text-slate-300">这里还没有消息</p>
+            <p class="mt-1 text-[12px] leading-relaxed text-slate-500">
+              说点什么，或者把文件拖进来。文件不会上传到服务器，点「下载」后才会走 P2P 直连。
+            </p>
+          </div>
+        </div>
+
+        <!-- 正在输入 -->
+        <div id="typing-hint" class="h-5 px-5 text-[11px] text-slate-500 opacity-0 transition-opacity"></div>
+
+        <!-- 输入区 -->
+        <div id="composer" class="safe-bottom border-t border-white/10 bg-[#0b1020]/60 px-3 pt-3 backdrop-blur sm:px-4">
+          <div class="flex items-end gap-2 rounded-2xl border border-white/10 bg-white/[0.03] p-2 transition focus-within:border-indigo-400/40 focus-within:ring-2 focus-within:ring-indigo-500/10">
+            <button id="btn-attach" type="button" aria-label="选择文件"
+                    class="mb-0.5 shrink-0 rounded-xl px-2.5 py-2 text-lg leading-none text-slate-400 transition hover:bg-white/5 hover:text-slate-200">
+              📎
+            </button>
+            <textarea id="input-message" rows="1" maxlength="2000" placeholder="说点什么…（Shift+Enter 换行）"
+                      class="max-h-40 min-h-[38px] flex-1 resize-none bg-transparent py-2 text-sm leading-relaxed text-slate-100 placeholder:text-slate-600 focus:outline-none"></textarea>
+            <button id="btn-send" type="button"
+                    class="mb-0.5 shrink-0 rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-400 active:scale-[.98] disabled:opacity-40">
+              发送
+            </button>
+          </div>
+          <p class="px-1 pt-2 text-[10px] leading-relaxed text-slate-600">
+            Enter 发送 · Shift+Enter 换行 · 支持粘贴 / 拖拽文件 · 文本由服务器中转并过滤敏感词，文件走 P2P 直连
+          </p>
+          <input id="file-input" type="file" multiple class="hidden" />
+        </div>
+      </section>
+    </div>
+
+    <!-- 移动端成员抽屉的遮罩 -->
+    <div id="drawer-backdrop" class="fixed inset-0 z-30 hidden bg-black/60 backdrop-blur-sm lg:hidden"></div>
+  </main>
+
+  <!-- 拖拽提示层 -->
+  <div id="drop-overlay" class="pointer-events-none fixed inset-0 z-40 hidden items-center justify-center bg-indigo-950/70 backdrop-blur-sm">
+    <div class="rounded-2xl border-2 border-dashed border-indigo-300/60 px-10 py-8 text-center">
+      <p class="text-lg font-semibold text-white">松手即可发送</p>
+      <p class="mt-1 text-xs text-indigo-200">文件不会上传，只广播一条卡片，等对方点下载</p>
+    </div>
+  </div>
+
+  <!-- 弹层与提示的挂载点 -->
+  <div id="modal-root"></div>
+  <div id="toast-root" class="pointer-events-none fixed inset-x-0 bottom-4 z-50 flex flex-col items-center gap-2 px-4"></div>
+
+  <!-- Socket.io 客户端由后端自己托管，不依赖外网 CDN -->
+  <script src="/socket.io/socket.io.js"></script>
+
+  <!-- ==================================================================
+       三、前端业务逻辑
+       ================================================================== -->
+  <script>
+  (() => {
+    'use strict';
+
+    /* ================================================================
+     * 3.1 常量
+     * ================================================================ */
+
+    /**
+     * ICE 服务器：自建 STUN 主用 + Google 公共 STUN 兜底。
+     * 注意：只有 STUN 没有 TURN，双方都是对称型 NAT 时会打洞失败，
+     * 这是「不经过服务器」的必然代价，UI 需要给出明确提示。
+     */
+    const ICE_SERVERS = [
+      { urls: 'stun:piik.siyin.fun:3478' },
+      {
+        urls: [
+          'stun:stun.l.google.com:19302',
+          'stun:stun1.l.google.com:19302',
+          'stun:stun2.l.google.com:19302',
+        ],
+      },
+    ];
+
+    const CHUNK_SIZE = 16 * 1024;            // 16KB 分片，兼容性最好的 SCTP 消息尺寸
+    const BUFFER_HIGH_WATER = 4 * 1024 * 1024; // 发送缓冲区超过 4MB 就先歇一会儿（背压）
+    const CONNECT_TIMEOUT_MS = 25000;        // P2P 建连超时
+    const STALL_TIMEOUT_MS = 12000;          // 数据通道静默多久算卡死
+    const HEARTBEAT_MS = 3000;               // 心跳间隔
+    const MAX_ICE_RESTARTS = 2;              // 最多尝试两次打洞重连
+    const MAX_FILE_BYTES = 1024 * 1024 * 1024; // 单文件 1GB（浏览器端拼 Blob 的内存上限）
+    const MAX_ACTIVE_SENDS = 3;              // 同时对外发送的文件数上限
+    const HISTORY_LIMIT = 200;               // 前端内存里最多保留的渲染条数
+
+    /** 需求原文里的失败文案，集中在这里，避免多处不一致 */
+    const STRICT_NETWORK_HINT = '网络环境严格，P2P 连接失败，请确保双方网络未被严格限制';
+
+    const LS_NAME = 'burnchat:name';
+    const LS_USER_ID = 'burnchat:userId';
+    /** 旧版本把「房间号 -> 房间暗号」存进 localStorage，现已废弃，启动时顺手清掉 */
+    const LS_LEGACY_ROOMS = 'burnchat:rooms';
+
+    const PALETTE = [
+      'bg-indigo-500', 'bg-sky-500', 'bg-emerald-500', 'bg-amber-500',
+      'bg-rose-500', 'bg-violet-500', 'bg-teal-500', 'bg-fuchsia-500',
+    ];
+
+    /* ================================================================
+     * 3.2 状态
+     * ================================================================ */
+
+    const state = {
+      socket: null,
+      self: { userId: '', userName: '' },
+      /**
+       * 服务级口令：只放内存，绝不写 localStorage。
+       * 刷新页面 = 重新输入（这正是「暗号必须输入才能用」的保证）。
+       */
+      accessCode: '',
+      /** 口令是否已通过服务端校验（决定两个入口按钮显不显示） */
+      accessVerified: false,
+      /**
+       * 邀请链接带进来的房间号（?room=xxx），会一直显示在首页闸门上。
+       * 单独存一份而不是每次读地址栏：离开房间回到首页时地址栏会被清掉，
+       * 但用户显然还想再进这个房间。
+       */
+      invitedRoomId: '',
+      /** @type {{id:string}|null} */
+      room: null,
+      /** @type {Array<{socketId:string,userId:string,userName:string}>} */
+      members: [],
+      /** @type {Array<Object>} 与服务器同步的消息（文本 / 文件卡片） */
+      messages: [],
+      /** @type {Map<string, File>} 发送方在内存里持有的原始文件 */
+      files: new Map(),
+      /** @type {Map<string, Object>} transferId -> 传输会话 */
+      transfers: new Map(),
+      /** @type {Map<string, Object>} fileId -> 卡片 DOM 引用 */
+      cards: new Map(),
+      typingName: '',
+      typingTimer: null,
+      textTypingStop: null,
+      rejoining: false,
+      booted: false,
+    };
+
+    /* ================================================================
+     * 3.3 DOM 小工具
+     * ================================================================ */
+
+    const $ = (sel) => document.querySelector(sel);
+
+    /** 创建元素：el('div', 'class...', '文本') */
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined && text !== null) node.textContent = text;
+      return node;
+    }
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    function randHex(bytes) {
+      const buf = new Uint8Array(bytes);
+      crypto.getRandomValues(buf);
+      return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function formatBytes(n) {
+      if (!Number.isFinite(n) || n <= 0) return '0 B';
+      if (n < 1024) return `${Math.round(n)} B`;
+      const units = ['KB', 'MB', 'GB', 'TB'];
+      let value = n / 1024;
+      let i = 0;
+      while (value >= 1024 && i < units.length - 1) {
+        value /= 1024;
+        i += 1;
+      }
+      return `${value >= 100 ? value.toFixed(0) : value.toFixed(1)} ${units[i]}`;
+    }
+
+    function formatTime(ts) {
+      try {
+        return new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+      } catch {
+        return '';
+      }
+    }
+
+    function colorFor(id) {
+      let hash = 0;
+      for (let i = 0; i < id.length; i += 1) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
+      return PALETTE[hash % PALETTE.length];
+    }
+
+    function initialsOf(name) {
+      const chars = Array.from((name || '?').trim());
+      return (chars.length > 1 ? chars.slice(0, 2) : chars).join('').toUpperCase();
+    }
+
+    /* ================================================================
+     * 3.4 提示条（toast）
+     * ================================================================ */
+
+    const TOAST_STYLE = {
+      info: 'border-white/10 bg-[#141a2e] text-slate-200',
+      success: 'border-emerald-400/25 bg-emerald-500/15 text-emerald-200',
+      warn: 'border-amber-400/25 bg-amber-500/15 text-amber-100',
+      error: 'border-rose-400/25 bg-rose-500/15 text-rose-100',
+    };
+
+    function toast(message, type = 'info', duration = 3800) {
+      if (!message) return;
+      const root = $('#toast-root');
+      const node = el(
+        'div',
+        `pointer-events-auto max-w-md rounded-xl border px-4 py-2.5 text-[13px] leading-relaxed shadow-xl shadow-black/30 transition-all duration-200 ${TOAST_STYLE[type] || TOAST_STYLE.info}`,
+        message,
+      );
+      root.appendChild(node);
+      setTimeout(() => {
+        node.classList.add('translate-y-2', 'opacity-0');
+        setTimeout(() => node.remove(), 220);
+      }, duration);
+    }
+
+    /* ================================================================
+     * 3.5 通用弹层（输入暗号 / 重建确认 / 离开确认）
+     * ================================================================ */
+
+    /**
+     * @param {{
+     *   title: string,
+     *   description?: string,
+     *   fields?: Array<{name:string,label:string,type?:string,value?:string,placeholder?:string,maxLength?:number}>,
+     *   confirmText?: string,
+     *   cancelText?: string|null,
+     *   danger?: boolean,
+     *   validate?: (values: Record<string,string>) => (string|null)
+     * }} options
+     * @returns {Promise<Record<string,string>|null>}
+     */
+    function showModal(options) {
+      return new Promise((resolve) => {
+        const root = $('#modal-root');
+        const backdrop = el('div', 'fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-sm');
+        const panel = el('div', 'w-full max-w-sm rounded-2xl border border-white/10 bg-[#141a2e] p-5 shadow-2xl');
+
+        panel.appendChild(el('h2', 'text-base font-semibold text-white', options.title));
+        if (options.description) {
+          panel.appendChild(el('p', 'mt-1.5 text-[12px] leading-relaxed text-slate-400', options.description));
+        }
+
+        const inputs = new Map();
+        const fields = options.fields || [];
+        fields.forEach((field) => {
+          const wrap = el('label', 'mt-4 block');
+          wrap.appendChild(el('span', 'mb-1.5 block text-[11px] uppercase tracking-wider text-slate-500', field.label));
+          const input = el('input', 'w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-600 focus:border-indigo-400/60 focus:outline-none focus:ring-2 focus:ring-indigo-500/20');
+          input.type = field.type || 'text';
+          input.value = field.value || '';
+          if (field.placeholder) input.placeholder = field.placeholder;
+          if (field.maxLength) input.maxLength = field.maxLength;
+          input.autocomplete = 'off';
+          wrap.appendChild(input);
+          panel.appendChild(wrap);
+          inputs.set(field.name, input);
+        });
+
+        const errorLine = el('p', 'mt-2 hidden text-[12px] text-rose-300');
+        panel.appendChild(errorLine);
+
+        const actions = el('div', 'mt-5 flex gap-2');
+        const confirmBtn = el(
+          'button',
+          `flex-1 rounded-xl px-4 py-2.5 text-sm font-semibold text-white transition active:scale-[.99] ${options.danger ? 'bg-rose-500 hover:bg-rose-400' : 'bg-indigo-500 hover:bg-indigo-400'}`,
+          options.confirmText || '确定',
+        );
+        confirmBtn.type = 'button';
+        actions.appendChild(confirmBtn);
+
+        let cancelBtn = null;
+        if (options.cancelText !== null) {
+          cancelBtn = el('button', 'flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2.5 text-sm font-semibold text-slate-200 transition hover:bg-white/[0.08]', options.cancelText || '取消');
+          cancelBtn.type = 'button';
+          actions.appendChild(cancelBtn);
+        }
+        panel.appendChild(actions);
+        backdrop.appendChild(panel);
+
+        let settled = false;
+        const close = (value) => {
+          if (settled) return;
+          settled = true;
+          document.removeEventListener('keydown', onKey, true);
+          backdrop.remove();
+          resolve(value);
+        };
+
+        const collect = () => {
+          const values = {};
+          inputs.forEach((input, name) => { values[name] = input.value; });
+          return values;
+        };
+
+        const submit = () => {
+          const values = collect();
+          const error = options.validate ? options.validate(values) : null;
+          if (error) {
+            errorLine.textContent = error;
+            errorLine.classList.remove('hidden');
+            return;
+          }
+          close(values);
+        };
+
+        const onKey = (event) => {
+          if (event.key === 'Escape') { event.stopPropagation(); close(null); }
+          if (event.key === 'Enter') { event.preventDefault(); submit(); }
+        };
+
+        confirmBtn.addEventListener('click', submit);
+        cancelBtn?.addEventListener('click', () => close(null));
+        backdrop.addEventListener('mousedown', (event) => {
+          if (event.target === backdrop) close(null);
+        });
+        document.addEventListener('keydown', onKey, true);
+
+        root.appendChild(backdrop);
+        const first = fields.length ? inputs.get(fields[0].name) : confirmBtn;
+        setTimeout(() => first?.focus(), 30);
+      });
+    }
+
+    /* ================================================================
+     * 3.6 localStorage：只缓存昵称与 userId
+     * ================================================================ */
+
+    function loadIdentity() {
+      let userId = localStorage.getItem(LS_USER_ID);
+      if (!userId || !/^[A-Za-z0-9_-]{4,64}$/.test(userId)) {
+        userId = `u_${randHex(8)}`;
+        localStorage.setItem(LS_USER_ID, userId);
+      }
+      state.self.userId = userId;
+      state.self.userName = (localStorage.getItem(LS_NAME) || '').slice(0, 20);
+    }
+
+    function saveName(name) {
+      state.self.userName = name;
+      localStorage.setItem(LS_NAME, name);
+      renderIdentity();
+    }
+
+    function ensureName() {
+      if (state.self.userName.trim()) return state.self.userName.trim();
+      const fallback = `访客${randHex(2)}`;
+      saveName(fallback);
+      $('#input-name').value = fallback;
+      return fallback;
+    }
+
+    /**
+     * 旧版本把每个房间的暗号缓存到了 localStorage，等于把密钥落盘。
+     * 现在改成服务级口令 + 只存内存，这里主动把历史残留清掉。
+     */
+    function purgeLegacySecrets() {
+      try {
+        if (localStorage.getItem(LS_LEGACY_ROOMS) !== null) {
+          localStorage.removeItem(LS_LEGACY_ROOMS);
+          console.info('[gate] 已清除旧版本留在本机的房间暗号缓存');
+        }
+      } catch {
+        // 隐私模式下 localStorage 可能不可用，忽略即可
+      }
+    }
+
+    /* ================================================================
+     * 3.7 Socket 封装
+     * ================================================================ */
+
+    function connectSocket() {
+      const socket = io({
+        transports: ['websocket', 'polling'],
+        reconnection: true,
+        reconnectionDelay: 600,
+        reconnectionDelayMax: 5000,
+        timeout: 10000,
+      });
+      state.socket = socket;
+      bindSocketEvents(socket);
+      return socket;
+    }
+
+    /**
+     * 带超时的 ack 封装：服务器没响应时不会永远挂起。
+     * 首屏加载时 socket 可能还在连接中，此时先等 connect 事件再发送。
+     * @returns {Promise<{ok:boolean, error?:string, message?:string} & Record<string, any>>}
+     */
+    function emitAck(event, payload, timeoutMs = 10000) {
+      return new Promise((resolve) => {
+        const socket = state.socket;
+        if (!socket) {
+          resolve({ ok: false, error: 'offline', message: '与服务器的连接已断开，请稍候重试' });
+          return;
+        }
+        let settled = false;
+        const finish = (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        };
+        const timer = setTimeout(
+          () => finish({ ok: false, error: 'timeout', message: '服务器没有响应，请重试' }),
+          timeoutMs,
+        );
+
+        const send = () => {
+          if (!socket.connected) {
+            finish({ ok: false, error: 'offline', message: '与服务器的连接已断开，请稍候重试' });
+            return;
+          }
+          socket.emit(event, payload, (response) => {
+            finish(response && typeof response === 'object' ? response : { ok: false, error: 'bad_response' });
+          });
+        };
+
+        if (socket.connected) send();
+        else socket.once('connect', send); // 超时由上面的 timer 兜底
+      });
+    }
+
+    function bindSocketEvents(socket) {
+      socket.on('connect', () => {
+        renderConnStatus(true);
+        if (state.room && state.booted) rejoinRoom();
+      });
+
+      socket.on('disconnect', (reason) => {
+        renderConnStatus(false);
+        if (state.room && reason !== 'io client disconnect') {
+          toast('与服务器的连接中断，正在自动重连…', 'warn');
+        }
+      });
+
+      socket.on('connect_error', () => renderConnStatus(false));
+
+      socket.on('message:new', (message) => {
+        if (!message || !state.room) return;
+        appendMessage(message);
+      });
+
+      socket.on('room:members', (payload) => {
+        if (!Array.isArray(payload?.members)) return;
+        state.members = payload.members;
+        renderMembers();
+        renderRoomHeader();
+        // 谁走了，就把跟他的传输判死，避免卡片一直转圈
+        const alive = new Set(state.members.map((m) => m.socketId));
+        for (const session of [...state.transfers.values()]) {
+          if (!alive.has(session.peerSocketId)) {
+            failTransfer(session, 'peer_left', '对方已离开房间，传输中断');
+          }
+        }
+      });
+
+      socket.on('room:notice', (notice) => {
+        if (!notice || typeof notice.text !== 'string') return;
+        appendNotice(notice.text, notice.at);
+      });
+
+      socket.on('typing', (payload) => {
+        if (!payload || !state.room) return;
+        if (payload.userId === state.self.userId) return;
+        showTyping(payload.isTyping ? payload.userName : '');
+      });
+
+      socket.on('file:request', (payload) => handleFileRequest(payload));
+
+      socket.on('signal', (payload) => handleSignal(payload));
+    }
+
+    /* ================================================================
+     * 3.8 视图切换与渲染
+     * ================================================================ */
+
+    function showHome() {
+      state.room = null;
+      state.messages = [];
+      state.members = [];
+      state.cards.clear();
+      closeAllTransfers();
+      $('#view-chat').classList.add('hidden');
+      $('#view-home').classList.remove('hidden');
+      $('#member-list').replaceChildren();
+      $('#message-list').querySelectorAll('[data-msg-id], [data-notice-id]').forEach((n) => n.remove());
+      $('#empty-state').classList.remove('hidden');
+      $('#typing-hint').textContent = '';
+      setMemberPanel(false);
+      // 回到首页时地址栏保留邀请房间号，方便「再进去一次」
+      syncUrl(state.invitedRoomId || null);
+      renderIdentity();
+      // 回到首页 = 重新验口令（口令不留在页面上，也不留在存储里）
+      resetAccessGate();
+    }
+
+    function enterChatView(result) {
+      state.room = { id: result.roomId };
+      // 记住这个房间号：离开后首页闸门依然显示它，地址栏也不会丢
+      state.invitedRoomId = result.roomId;
+      state.members = Array.isArray(result.members) ? result.members : [];
+      state.messages = Array.isArray(result.messages) ? result.messages.slice(-HISTORY_LIMIT) : [];
+
+      $('#view-home').classList.add('hidden');
+      $('#view-chat').classList.remove('hidden');
+
+      syncUrl(result.roomId);
+      renderRoomHeader();
+      renderMembers();
+      renderMessages();
+      renderConnStatus(state.socket?.connected ?? false);
+      setMemberPanel(false);
+
+      const input = $('#input-message');
+      input.value = '';
+      autoGrow();
+      setTimeout(() => input.focus(), 60);
+    }
+
+    function syncUrl(roomId) {
+      const url = new URL(window.location.href);
+      if (roomId) url.searchParams.set('room', roomId);
+      else url.searchParams.delete('room');
+      window.history.replaceState({}, '', url.pathname + url.search);
+    }
+
+    function renderIdentity() {
+      const name = state.self.userName.trim();
+      // 用户正在输入昵称时不回写，避免打断光标位置
+      const input = $('#input-name');
+      if (document.activeElement !== input && input.value !== name) input.value = name;
+      const avatar = $('#identity-avatar');
+      avatar.textContent = name ? initialsOf(name) : '我';
+      avatar.className = `flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white ${name ? colorFor(state.self.userId) : 'bg-indigo-500/80'}`;
+    }
+
+    function renderConnStatus(online) {
+      const pill = $('#conn-status');
+      if (!pill) return;
+      pill.textContent = online ? '已连接' : '重连中…';
+      pill.className = online
+        ? 'hidden rounded-full border border-emerald-400/20 bg-emerald-400/10 px-2 py-1 text-[10px] text-emerald-300 sm:inline-flex'
+        : 'hidden rounded-full border border-amber-400/25 bg-amber-400/10 px-2 py-1 text-[10px] text-amber-300 sm:inline-flex';
+    }
+
+    function renderRoomHeader() {
+      if (!state.room) return;
+      $('#room-title').textContent = state.room.id;
+      $('#room-subtitle').textContent = `${state.members.length} 人在线 · 消息不落盘 · 最多保留 50 条`;
+      $('#member-count').textContent = String(state.members.length);
+    }
+
+    function renderMembers() {
+      const list = $('#member-list');
+      list.replaceChildren();
+      for (const member of state.members) {
+        const item = el('li', 'flex items-center gap-2.5 rounded-xl px-2 py-2 transition hover:bg-white/[0.04]');
+        const avatar = el(
+          'span',
+          `relative flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold text-white ${colorFor(member.userId)}`,
+          initialsOf(member.userName),
+        );
+        avatar.appendChild(el('span', 'absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#0b1020] bg-emerald-400'));
+        item.appendChild(avatar);
+
+        const text = el('div', 'min-w-0 flex-1');
+        const nameRow = el('div', 'flex items-center gap-1.5');
+        nameRow.appendChild(el('span', 'truncate text-[13px] text-slate-200', member.userName));
+        if (member.userId === state.self.userId) {
+          nameRow.appendChild(el('span', 'shrink-0 rounded bg-indigo-500/20 px-1 text-[10px] text-indigo-300', '我'));
+        }
+        text.appendChild(nameRow);
+        text.appendChild(el('span', 'block truncate text-[10px] text-emerald-400/80', '在线'));
+        item.appendChild(text);
+        list.appendChild(item);
+      }
+    }
+
+    /* ---------------- 消息渲染 ---------------- */
+
+    function renderMessages() {
+      const list = $('#message-list');
+      const empty = $('#empty-state');
+      list.querySelectorAll('[data-msg-id], [data-notice-id]').forEach((node) => node.remove());
+      state.cards.clear();
+
+      let prev = null;
+      for (const message of state.messages) {
+        list.appendChild(buildMessageNode(message, prev));
+        prev = message;
+      }
+      empty.classList.toggle('hidden', state.messages.length > 0);
+      scrollToBottom(true);
+    }
+
+    function appendMessage(message) {
+      const list = $('#message-list');
+      $('#empty-state').classList.add('hidden');
+
+      const prev = state.messages.length ? state.messages[state.messages.length - 1] : null;
+      const node = buildMessageNode(message, prev);
+      node.classList.add('bubble-in');
+      list.appendChild(node);
+      state.messages.push(message);
+
+      // 前端不需要无限记忆：超过上限就整体重渲染一次
+      if (state.messages.length > HISTORY_LIMIT) {
+        state.messages = state.messages.slice(-HISTORY_LIMIT);
+        renderMessages();
+        return;
+      }
+      scrollToBottom(false);
+    }
+
+    function appendNotice(text, at) {
+      const list = $('#message-list');
+      const row = el('div', 'flex items-center justify-center');
+      row.dataset.noticeId = randHex(4);
+      const pill = el('span', 'rounded-full bg-white/[0.04] px-3 py-1 text-[11px] text-slate-500', `${formatTime(at || Date.now())} · ${text}`);
+      row.appendChild(pill);
+      list.appendChild(row);
+      scrollToBottom(false);
+    }
+
+    function isMine(message) {
+      return message.userId === state.self.userId;
+    }
+
+    function buildMessageNode(message, prev) {
+      const mine = isMine(message);
+      const grouped = Boolean(
+        prev &&
+        prev.type === message.type &&
+        prev.userId === message.userId &&
+        message.at - prev.at < 5 * 60 * 1000,
+      );
+
+      const row = el('div', `flex items-end gap-2 ${mine ? 'flex-row-reverse' : ''}`);
+      row.dataset.msgId = message.id;
+
+      // 头像（同一人连续发言时留白，避免刷屏）
+      if (grouped) {
+        row.appendChild(el('span', 'h-8 w-8 shrink-0'));
+      } else {
+        row.appendChild(el(
+          'span',
+          `flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold text-white ${colorFor(message.userId)}`,
+          initialsOf(message.userName),
+        ));
+      }
+
+      const column = el('div', `flex min-w-0 max-w-[82%] flex-col ${mine ? 'items-end' : 'items-start'}`);
+
+      if (!grouped) {
+        const meta = el('div', 'mb-1 flex items-center gap-1.5 px-0.5 text-[11px] text-slate-500');
+        meta.appendChild(el('span', 'font-medium text-slate-400', mine ? '我' : message.userName));
+        meta.appendChild(el('span', 'text-slate-600', formatTime(message.at)));
+        if (message.filtered) {
+          meta.appendChild(el('span', 'rounded bg-amber-500/15 px-1 py-0.5 text-[10px] text-amber-300', '敏感词已过滤'));
+        }
+        column.appendChild(meta);
+      }
+
+      // 文本气泡
+      if (message.type === 'text') {
+        const bubble = el(
+          'div',
+          mine
+            ? 'rounded-2xl rounded-br-md bg-indigo-500 px-3.5 py-2 text-[14px] leading-relaxed text-white shadow-lg shadow-indigo-900/20'
+            : 'rounded-2xl rounded-bl-md border border-white/10 bg-white/[0.06] px-3.5 py-2 text-[14px] leading-relaxed text-slate-100',
+        );
+        bubble.appendChild(el('div', 'whitespace-pre-wrap break-words', message.text));
+        column.appendChild(bubble);
+      }
+
+      // 文件卡片
+      if (message.type === 'file' && message.file) {
+        column.appendChild(buildFileCard(message, mine));
+      }
+
+      row.appendChild(column);
+      return row;
+    }
+
+    /**
+     * 文件卡片：图标 + 文件名 + 大小 + 下载按钮 + 进度条 + 状态文案
+     */
+    function buildFileCard(message, mine) {
+      const file = message.file;
+      const card = el('div', 'w-[292px] max-w-full rounded-2xl border border-white/10 bg-[#101728]/90 p-3 shadow-lg shadow-black/20');
+      card.dataset.fileId = file.fileId;
+
+      const top = el('div', 'flex items-start gap-3');
+      top.appendChild(el('div', 'flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-indigo-500/15 text-lg', '📄'));
+
+      const info = el('div', 'min-w-0 flex-1');
+      info.appendChild(el('p', 'truncate text-[13px] font-medium text-slate-100', file.name));
+      info.appendChild(el('p', 'mt-0.5 text-[11px] text-slate-500', `${formatBytes(file.size)}${file.mime ? ` · ${file.mime.split('/')[0]}` : ''}`));
+      top.appendChild(info);
+
+      const button = el(
+        'button',
+        mine
+          ? 'hidden shrink-0 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-[12px] text-slate-300 transition hover:bg-white/[0.08]'
+          : 'shrink-0 rounded-lg bg-indigo-500 px-3 py-1.5 text-[12px] font-medium text-white transition hover:bg-indigo-400 active:scale-[.98]',
+        '下载',
+      );
+      button.type = 'button';
+      top.appendChild(button);
+      card.appendChild(top);
+
+      // 进度条
+      const initialText = mine ? '等待对方点击「下载」' : '点击「下载」，双方建立 P2P 直连';
+      const barWrap = el('div', 'mt-2.5 hidden');
+      const barTrack = el('div', 'h-1.5 w-full overflow-hidden rounded-full bg-white/10');
+      const bar = el('div', 'h-full w-0 rounded-full bg-gradient-to-r from-indigo-400 to-cyan-400 transition-[width] duration-150');
+      barTrack.appendChild(bar);
+      const barMeta = el('div', 'mt-1 flex justify-between text-[10px] text-slate-500');
+      const status = el('span', mine ? 'text-slate-500' : 'text-slate-400', initialText);
+      const percent = el('span', '', '');
+      barMeta.appendChild(status);
+      barMeta.appendChild(percent);
+      barWrap.appendChild(barTrack);
+      barWrap.appendChild(barMeta);
+      card.appendChild(barWrap);
+
+      // 状态行：没有进度时单独显示（有进度时由进度条下方的文字代替）
+      const statusLine = el('p', 'mt-2 text-[11px] text-slate-500', initialText);
+      card.appendChild(statusLine);
+
+      state.cards.set(file.fileId, {
+        root: card,
+        button,
+        barWrap,
+        barTrack,
+        bar,
+        percent,
+        status,
+        statusLine,
+        message,
+      });
+
+      button.addEventListener('click', () => {
+        const active = activeTransferForFile(file.fileId);
+        if (active) {
+          cancelTransfer(active);
+          return;
+        }
+        requestDownload(file.fileId);
+      });
+
+      return card;
+    }
+
+    /**
+     * 统一更新卡片外观。
+     * @param {string} fileId
+     * @param {{progress?: number|null, tone?: 'idle'|'active'|'ok'|'warn'|'error', text?: string, buttonLabel?: string, buttonDisabled?: boolean, buttonHidden?: boolean}} patch
+     */
+    function paintCard(fileId, patch) {
+      const card = state.cards.get(fileId);
+      if (!card) return;
+      const toneClass = {
+        idle: 'text-slate-500',
+        active: 'text-indigo-300',
+        ok: 'text-emerald-400',
+        warn: 'text-amber-300',
+        error: 'text-rose-300',
+      }[patch.tone || 'idle'];
+
+      if (patch.text !== undefined) {
+        card.status.textContent = patch.text;
+        card.status.className = `text-[11px] ${toneClass}`;
+        card.statusLine.textContent = patch.text;
+        card.statusLine.className = `mt-2 text-[11px] ${toneClass}`;
+      }
+
+      if (patch.progress !== undefined) {
+        if (patch.progress === null) {
+          card.barWrap.classList.add('hidden');
+          card.statusLine.classList.remove('hidden');
+        } else {
+          const pct = Math.max(0, Math.min(1, patch.progress));
+          card.barWrap.classList.remove('hidden');
+          card.statusLine.classList.add('hidden');
+          card.bar.style.width = `${(pct * 100).toFixed(1)}%`;
+          card.percent.textContent = `${Math.round(pct * 100)}%`;
+        }
+      }
+
+      if (patch.buttonLabel !== undefined) card.button.textContent = patch.buttonLabel;
+      if (patch.buttonHidden !== undefined) card.button.classList.toggle('hidden', patch.buttonHidden);
+      if (patch.buttonDisabled !== undefined) card.button.disabled = patch.buttonDisabled;
+    }
+
+    function scrollToBottom(force) {
+      const list = $('#message-list');
+      const distance = list.scrollHeight - list.scrollTop - list.clientHeight;
+      if (force || distance < 160) list.scrollTop = list.scrollHeight;
+    }
+
+    /* ================================================================
+     * 3.9 入口闸门：服务口令 -> 「进入房间 / 创建房间」
+     *
+     * 暗号必须输入，而且必须正确，否则这个服务用不了（前端隐藏按钮 +
+     * 后端每个入口都再校验一次，前端隐藏只是体验，不是安全边界）。
+     *
+     * 首页的形态就是：昵称 -> 服务口令输入框 ->（验对之后）两个按钮：
+     *   进入房间：用地址栏带进来的房间号（邀请链接），没有就手填；
+     *   创建房间：随机生成形如 room_a1b2 的房间号。
+     *
+     * 口令只放内存 state.accessCode，刷新即丢，绝不写 localStorage。
+     * ================================================================ */
+
+    let accessVerifyTimer = null; // 防抖句柄
+    let accessVerifySeq = 0; // 递增序号：丢弃过期的校验结果
+
+    function setAccessHint(text, type = 'info') {
+      const hint = $('#access-hint');
+      if (!text) {
+        hint.textContent = '';
+        hint.className = 'mt-2 hidden text-[11px] leading-relaxed';
+        return;
+      }
+      const tone = {
+        info: 'text-slate-400',
+        success: 'text-emerald-300',
+        error: 'text-rose-300',
+      }[type] || 'text-slate-400';
+      hint.textContent = text;
+      hint.className = `mt-2 text-[11px] leading-relaxed ${tone}`;
+    }
+
+    function setAccessMark(mark) {
+      const node = $('#access-mark');
+      if (!mark) {
+        node.textContent = '';
+        node.classList.add('hidden');
+        return;
+      }
+      node.textContent = mark;
+      node.className = `pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm leading-none ${mark === '✓' ? 'text-emerald-400' : 'text-rose-400'}`;
+    }
+
+    /** 地址栏里带的房间号（邀请链接 ?room=xxx） */
+    function roomIdFromUrl() {
+      // 优先用启动时记下的邀请房间号：showHome() 会把地址栏清干净，
+      // 但闸门上仍然要显示「你要进的是这间房」。
+      if (state.invitedRoomId) return state.invitedRoomId;
+      const raw = new URL(window.location.href).searchParams.get('room') || '';
+      return normalizeRoomIdClient(raw) || '';
+    }
+
+    /** 当前想进入的房间号：邀请链接优先，其次手填 */
+    function targetRoomId() {
+      const chipId = $('#room-chip-id').dataset.roomId || '';
+      if (chipId) return chipId;
+      return normalizeRoomIdClient($('#input-room').value) || '';
+    }
+
+    /**
+     * 「进入房间」需要先知道房间号（邀请链接带进来，或者手填），
+     * 没有号的时候直接禁用按钮，比点下去弹一句「请填写房间号」更清楚。
+     */
+    function syncEnterButton() {
+      const btn = $('#btn-enter');
+      if (!btn) return;
+      const ready = Boolean(targetRoomId());
+      btn.disabled = !ready;
+      btn.title = ready ? '' : '先填写房间号，或用邀请链接打开';
+    }
+
+    /** 房间号区域：有邀请链接就显示成卡片，没有就给一个输入框 */
+    function renderRoomIdRow() {
+      const urlRoom = roomIdFromUrl();
+      const chip = $('#room-chip');
+      const chipId = $('#room-chip-id');
+      const inputRoom = $('#input-room');
+
+      $('#room-id-row').classList.remove('hidden');
+      if (urlRoom) {
+        chipId.textContent = urlRoom;
+        chipId.dataset.roomId = urlRoom;
+        chip.classList.remove('hidden');
+        chip.classList.add('flex');
+        inputRoom.classList.add('hidden');
+      } else {
+        chipId.textContent = '';
+        delete chipId.dataset.roomId;
+        chip.classList.add('hidden');
+        chip.classList.remove('flex');
+        inputRoom.classList.remove('hidden');
+      }
+
+      syncEnterButton(); // 房间号从无到有 / 从有到无时，同步「进入房间」可用状态
+    }
+
+    /** 回到「什么都不能做」的初始态：清空口令、收起按钮 */
+    function resetAccessGate() {
+      state.accessCode = '';
+      state.accessVerified = false;
+      clearTimeout(accessVerifyTimer);
+      accessVerifySeq += 1; // 让还在飞的校验结果作废
+      const input = $('#input-access');
+      input.value = '';
+      input.disabled = false;
+      setAccessMark('');
+      setAccessHint('');
+      $('#enter-actions').classList.add('hidden');
+      $('#btn-create').disabled = false;
+      renderRoomIdRow();
+      syncEnterButton();
+    }
+
+    /** 服务端说口令不对（例如管理员换了口令）：立刻收回两个按钮 */
+    function invalidateAccess(message) {
+      state.accessCode = '';
+      state.accessVerified = false;
+      accessVerifySeq += 1;
+      $('#enter-actions').classList.add('hidden');
+      setAccessMark('✕');
+      setAccessHint(message || '服务口令已失效，请重新输入', 'error');
+      $('#input-access').focus();
+      $('#input-access').select();
+    }
+
+    function requireAccess() {
+      if (state.accessVerified && state.accessCode) return true;
+      setAccessHint('请先输入正确的服务口令', 'error');
+      $('#input-access').focus();
+      return false;
+    }
+
+    /** 输入变化：先收回按钮，再防抖校验 */
+    function onAccessInput() {
+      clearTimeout(accessVerifyTimer);
+      if (state.accessVerified) {
+        state.accessVerified = false;
+        state.accessCode = '';
+        $('#enter-actions').classList.add('hidden');
+      }
+      accessVerifySeq += 1; // 使上一次校验结果失效
+      setAccessMark('');
+      const code = $('#input-access').value.trim();
+      if (!code) {
+        setAccessHint('');
+        return;
+      }
+      setAccessHint('正在校验口令…');
+      accessVerifyTimer = setTimeout(() => verifyAccessCode(), 350);
+    }
+
+    /** 向服务端确认口令，通过后才让两个按钮出现 */
+    async function verifyAccessCode() {
+      const code = $('#input-access').value.trim();
+      if (!code || state.accessVerified) return;
+      const seq = ++accessVerifySeq;
+      const result = await emitAck('access:verify', { accessCode: code });
+      if (seq !== accessVerifySeq) return; // 期间又改了输入，丢弃旧结果
+
+      if (!result.ok) {
+        state.accessVerified = false;
+        state.accessCode = '';
+        $('#enter-actions').classList.add('hidden');
+        setAccessMark('✕');
+        setAccessHint(result.message || '口令不正确', 'error');
+        return;
+      }
+
+      state.accessCode = code;
+      state.accessVerified = true;
+      setAccessMark('✓');
+      setAccessHint('口令正确，可以创建或进入房间了', 'success');
+      $('#enter-actions').classList.remove('hidden');
+      // 没有邀请链接、也还没填房间号时，把焦点交给房间号输入框
+      if (!roomIdFromUrl() && !$('#input-room').value.trim()) $('#input-room').focus();
+    }
+
+    /* ================================================================
+     * 3.10 房间流程：进入 / 创建 / 重建 / 重连 / 离开
+     * ================================================================ */
+
+    function generateRoomId() {
+      return `room_${randHex(2)}`; // room_a1b2 形式
+    }
+
+    function normalizeRoomIdClient(raw) {
+      if (typeof raw !== 'string') return null;
+      let id = raw.trim().toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 29);
+      if (!id) return null;
+      if (!id.startsWith('room_')) id = `room_${id}`;
+      return /^room_[a-z0-9]{1,24}$/.test(id) ? id : null;
+    }
+
+    /** 「进入房间」：先 join，房间不存在再问要不要重建 */
+    async function enterRoomFlow() {
+      if (!requireAccess()) return;
+
+      const roomId = targetRoomId();
+      if (!roomId) {
+        setAccessHint('请填写要进入的房间号（形如 room_a1b2）', 'error');
+        $('#input-room').focus();
+        return;
+      }
+
+      const button = $('#btn-enter');
+      setBusy(button, true, '进入中…');
+      try {
+        const result = await joinRoom(roomId);
+        if (result.ok) return;
+
+        if (result.error === 'room_not_found') {
+          // 阅后即焚：房间没人在线就等于已被销毁
+          const answer = await showModal({
+            title: '这间房已经不在了',
+            description: `房间 ${roomId} 没有人在线，按阅后即焚的规则它已经被销毁，历史消息不会保留。要用同一个房间号重建一间空房吗？`,
+            confirmText: '重建并进入',
+            cancelText: '算了',
+          });
+          if (!answer) return;
+          const created = await createRoomWith(roomId);
+          if (created.ok) toast('房间已重建，历史消息无法恢复', 'warn', 5000);
+          else setAccessHint(created.message || '重建失败', 'error');
+          return;
+        }
+
+        if (result.error === 'bad_access_code' || result.error === 'locked') {
+          invalidateAccess(result.message);
+          return;
+        }
+        setAccessHint(result.message || '进入房间失败', 'error');
+      } finally {
+        setBusy(button, false);
+      }
+    }
+
+    /** 「创建房间」：随机房间号，撞号自动换一个重试 */
+    async function createRoomFlow() {
+      if (!requireAccess()) return;
+
+      const button = $('#btn-create');
+      setBusy(button, true, '创建中…');
+      try {
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          const result = await createRoomWith(generateRoomId());
+          if (result.ok) return;
+          if (result.error === 'room_exists') continue; // 撞号，换一个
+          if (result.error === 'bad_access_code' || result.error === 'locked') {
+            invalidateAccess(result.message);
+            return;
+          }
+          setAccessHint(result.message || '创建房间失败', 'error');
+          return;
+        }
+        setAccessHint('房间号连续冲突，请再点一次', 'error');
+      } finally {
+        setBusy(button, false);
+      }
+    }
+
+    /**
+     * 用指定房间号创建（「创建房间」与「重建已焚毁的房间」共用）。
+     * @returns {Promise<{ok:boolean, error?:string, message?:string}>}
+     */
+    async function createRoomWith(roomId, options = {}) {
+      const result = await emitAck('room:create', {
+        roomId,
+        accessCode: state.accessCode,
+        userId: state.self.userId,
+        userName: ensureName(),
+      });
+      if (!result.ok) return result;
+
+      enterChatView(result);
+      if (!options.quiet) toast(`房间 ${result.roomId} 已就绪，把邀请链接发给对方吧`, 'success', 5000);
+      return result;
+    }
+
+    /** 发出 room:join，成功后切到聊天视图 */
+    async function joinRoom(roomId) {
+      const result = await emitAck('room:join', {
+        roomId,
+        accessCode: state.accessCode,
+        userId: state.self.userId,
+        userName: ensureName(),
+      });
+      if (!result.ok) return result;
+      enterChatView(result);
+      return result;
+    }
+
+    /** 断线重连：口令还在内存里，直接重新加入同一房间 */
+    async function rejoinRoom() {
+      if (!state.room || state.rejoining) return;
+      const { id } = state.room;
+      state.rejoining = true;
+      try {
+        const result = await emitAck('room:join', {
+          roomId: id,
+          accessCode: state.accessCode,
+          userId: state.self.userId,
+          userName: ensureName(),
+        }, 8000);
+
+        if (result.ok) {
+          state.members = result.members || [];
+          state.messages = (result.messages || []).slice(-HISTORY_LIMIT);
+          renderRoomHeader();
+          renderMembers();
+          renderMessages();
+          return;
+        }
+
+        if (result.error === 'room_not_found') {
+          // 刷新页面会先断开旧连接：若自己是最后一人，房间已经随断线焚毁了
+          const rebuilt = await createRoomWith(id, { quiet: true });
+          if (!rebuilt.ok) {
+            showHome();
+            toast('房间已被焚毁（最后一人离开时会立即销毁）', 'warn', 5000);
+          } else {
+            toast('页面刷新导致房间焚毁，已按原房间号重建空房间（历史消息不可恢复）', 'warn', 6000);
+          }
+          return;
+        }
+
+        if (result.error === 'bad_access_code' || result.error === 'locked') {
+          showHome();
+          toast('服务口令已失效，请重新输入', 'warn', 5000);
+          return;
+        }
+
+        toast(result.message || '重新进入房间失败', 'error');
+        showHome();
+      } finally {
+        state.rejoining = false;
+      }
+    }
+
+    async function leaveRoomFlow() {
+      const confirm = await showModal({
+        title: '离开这间房？',
+        description: '如果你是最后一位在线成员，房间与全部消息会立即焚毁，无法找回。',
+        confirmText: '离开',
+        cancelText: '继续聊',
+        danger: true,
+      });
+      if (!confirm) return;
+      await emitAck('room:leave', {});
+      showHome();
+      toast('已离开房间', 'info');
+    }
+
+    function setBusy(button, busy, busyText) {
+      if (!button) return;
+      if (busy) {
+        button.dataset.label = button.textContent;
+        button.textContent = busyText || '处理中…';
+        button.disabled = true;
+      } else {
+        if (button.dataset.label) button.textContent = button.dataset.label;
+        button.disabled = false;
+      }
+    }
+
+    /* ================================================================
+     * 3.11 文本消息 / 正在输入
+     * ================================================================ */
+
+    function autoGrow() {
+      const input = $('#input-message');
+      input.style.height = 'auto';
+      input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
+    }
+
+    async function sendText() {
+      const input = $('#input-message');
+      const text = input.value;
+      if (!text.trim()) return;
+      if (!state.room) return;
+
+      input.value = '';
+      autoGrow();
+      $('#btn-send').disabled = true; // 输入框已空，按钮回到禁用态
+      stopTypingSignal();
+
+      const result = await emitAck('message:send', { text });
+      if (!result.ok) {
+        // 发送失败要把内容还给用户
+        input.value = text;
+        autoGrow();
+        $('#btn-send').disabled = false;
+        toast(result.message || '消息发送失败', 'error');
+      }
+    }
+
+    function showTyping(name) {
+      const hint = $('#typing-hint');
+      clearTimeout(state.typingTimer);
+      if (!name) {
+        state.typingName = '';
+        hint.textContent = '';
+        hint.style.opacity = '0';
+        return;
+      }
+      state.typingName = name;
+      hint.textContent = `${name} 正在输入…`;
+      hint.style.opacity = '1';
+      state.typingTimer = setTimeout(() => showTyping(''), 2600);
+    }
+
+    function stopTypingSignal() {
+      clearTimeout(state.textTypingStop);
+      state.socket?.emit('typing', { isTyping: false });
+    }
+
+    function signalTyping() {
+      state.socket?.emit('typing', { isTyping: true });
+      clearTimeout(state.textTypingStop);
+      state.textTypingStop = setTimeout(() => {
+        state.socket?.emit('typing', { isTyping: false });
+      }, 1800);
+    }
+
+    /* ================================================================
+     * 3.12 发送文件：只广播元数据卡片
+     * ================================================================ */
+
+    async function sendFiles(fileList) {
+      const files = Array.from(fileList || []);
+      if (!files.length) return;
+      if (!state.room) return;
+
+      for (const file of files.slice(0, 8)) {
+        if (file.size > MAX_FILE_BYTES) {
+          toast(`${file.name} 超过 1GB，浏览器无法在内存中拼装`, 'error');
+          continue;
+        }
+        const fileId = `f_${randHex(10)}`;
+        state.files.set(fileId, file);
+        const result = await emitAck('file:announce', {
+          fileId,
+          name: file.name || '未命名文件',
+          size: file.size,
+          mime: file.type || '',
+        });
+        if (!result.ok) {
+          state.files.delete(fileId);
+          toast(result.message || '文件发送失败', 'error');
+        }
+      }
+    }
+
+    /* ================================================================
+     * 3.13 P2P 文件传输
+     * ================================================================ */
+
+    function rtcConfiguration() {
+      return { iceServers: ICE_SERVERS, iceCandidatePoolSize: 2 };
+    }
+
+    function createSession(options) {
+      const session = {
+        id: options.transferId,
+        role: options.role,                 // 'sender' | 'receiver'
+        fileId: options.fileId,
+        peerSocketId: options.peerSocketId,
+        fileName: options.fileName || '未命名文件',
+        size: Number(options.size) || 0,
+        mime: options.mime || '',
+        file: options.file || null,
+        pc: null,
+        dc: null,
+        state: 'new',                       // new|awaiting-offer|connecting|sending|receiving|closed|failed
+        chunks: [],
+        received: 0,
+        sent: 0,
+        lastRxAt: Date.now(),
+        lastPaintAt: 0,
+        startedAt: 0,
+        iceRestarts: 0,
+        pendingCandidates: [],
+        queue: Promise.resolve(),
+        heartbeat: null,
+        connectTimer: null,
+        done: false,
+      };
+      state.transfers.set(session.id, session);
+      return session;
+    }
+
+    function activeTransferForFile(fileId) {
+      for (const session of state.transfers.values()) {
+        if (session.fileId === fileId && session.state !== 'closed' && session.state !== 'failed' && !session.done) {
+          return session;
+        }
+      }
+      return null;
+    }
+
+    function activeSenderCount() {
+      let count = 0;
+      for (const session of state.transfers.values()) {
+        if (session.role === 'sender' && session.state !== 'closed' && session.state !== 'failed' && !session.done) count += 1;
+      }
+      return count;
+    }
+
+    function sendSignal(session, data) {
+      state.socket?.emit('signal', { to: session.peerSocketId, data });
+    }
+
+    function sendSignalTo(socketId, data) {
+      state.socket?.emit('signal', { to: socketId, data });
+    }
+
+    /** 按 transferId 串行处理信令，避免 offer/answer/candidate 乱序导致 setRemoteDescription 抛错 */
+    function enqueue(session, task) {
+      session.queue = session.queue
+        .then(task)
+        .catch((error) => {
+          console.error('[signal]', error);
+          if (session.state !== 'closed' && session.state !== 'failed') {
+            failTransfer(session, 'signal_error', '连接协商失败，请重试');
+          }
+        });
+    }
+
+    /* ---------------- 接收方：发起下载 ---------------- */
+
+    async function requestDownload(fileId) {
+      const card = state.cards.get(fileId);
+      const message = card?.message;
+      if (!message || !message.file) return;
+
+      const target = resolveSenderSocket(message);
+      if (!target) {
+        toast('发送方已不在线，无法建立 P2P 连接', 'error');
+        return;
+      }
+
+      const transferId = `t_${randHex(10)}`;
+      const session = createSession({
+        role: 'receiver',
+        transferId,
+        fileId,
+        peerSocketId: target.socketId,
+        fileName: message.file.name,
+        size: message.file.size,
+        mime: message.file.mime,
+      });
+
+      paintCard(fileId, {
+        text: `正在向 ${target.userName} 发起下载请求…`,
+        tone: 'active',
+        progress: null,
+        buttonLabel: '取消',
+        buttonHidden: false,
+        buttonDisabled: false,
+      });
+
+      const result = await emitAck('file:request', { fileId, transferId, to: target.socketId });
+      if (!result.ok) {
+        failTransfer(session, result.error || 'request_failed', result.message || '无法发起下载');
+        return;
+      }
+      await startReceiverPeer(session);
+    }
+
+    /**
+     * 解析文件消息的发送者当前连接。
+     * 消息里记了发送者当时的 socketId；对方重连后 socketId 会变，此时按 userId 兜底匹配。
+     * @param {{file?: {senderSocketId?: string}, userId?: string}} message 文件卡片消息
+     * @returns {{socketId: string, userId: string, userName: string} | null}
+     */
+    function resolveSenderSocket(message) {
+      const file = message?.file;
+      if (!file) return null;
+      const bySocket = state.members.find((m) => m.socketId === file.senderSocketId);
+      if (bySocket) return bySocket;
+      return state.members.find((m) => m.userId === message.userId) || null;
+    }
+
+    async function startReceiverPeer(session) {
+      try {
+        const pc = new RTCPeerConnection(rtcConfiguration());
+        session.pc = pc;
+        bindPeerEvents(session);
+
+        // 下载方负责创建 DataChannel，也就意味着它是 offer 方
+        const dc = pc.createDataChannel('burnchat-file', { ordered: true });
+        session.dc = dc;
+        wireDataChannel(session);
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        session.state = 'connecting';
+        sendSignal(session, {
+          kind: 'offer',
+          transferId: session.id,
+          fileId: session.fileId,
+          sdp: pc.localDescription,
+        });
+
+        paintCard(session.fileId, {
+          text: '正在通过 STUN 打洞建立连接…',
+          tone: 'active',
+          progress: null,
+          buttonLabel: '取消',
+          buttonHidden: false,
+        });
+
+        session.connectTimer = setTimeout(() => {
+          if (session.state === 'connecting' || session.state === 'new') {
+            failTransfer(session, 'connect_timeout', `${STRICT_NETWORK_HINT}（连接超时）`);
+          }
+        }, CONNECT_TIMEOUT_MS);
+      } catch (error) {
+        console.error('[receiver] 创建 PeerConnection 失败', error);
+        failTransfer(session, 'pc_error', '初始化 WebRTC 失败，请刷新页面重试');
+      }
+    }
+
+    /* ---------------- 发送方：收到下载请求 ---------------- */
+
+    function handleFileRequest(payload) {
+      if (!payload || typeof payload !== 'object') return;
+      const { fileId, transferId, from } = payload;
+      const file = state.files.get(fileId);
+
+      if (!file) {
+        // 发送方刷新过页面，File 对象已经没了
+        sendSignalTo(from.socketId, { kind: 'reject', transferId, reason: 'file_unavailable' });
+        paintCard(fileId, { text: '原文件已失效，请让对方重新发送', tone: 'error', progress: null });
+        return;
+      }
+      if (activeSenderCount() >= MAX_ACTIVE_SENDS) {
+        sendSignalTo(from.socketId, { kind: 'reject', transferId, reason: 'busy' });
+        toast('同时发送的文件太多，请稍后再试', 'warn');
+        return;
+      }
+
+      const existing = state.transfers.get(transferId);
+      if (existing && existing.state !== 'failed' && existing.state !== 'closed') return;
+
+      const session = createSession({
+        role: 'sender',
+        transferId,
+        fileId,
+        peerSocketId: from.socketId,
+        fileName: file.name,
+        size: file.size,
+        mime: file.type || '',
+        file,
+      });
+      session.state = 'awaiting-offer';
+
+      paintCard(fileId, {
+        text: `${from.userName} 正在下载，等待对方建立连接…`,
+        tone: 'active',
+        progress: 0,
+        buttonHidden: true,
+      });
+
+      session.connectTimer = setTimeout(() => {
+        if (session.state === 'awaiting-offer' || session.state === 'connecting') {
+          failTransfer(session, 'connect_timeout', '对方未能建立 P2P 连接（网络可能受限）');
+        }
+      }, CONNECT_TIMEOUT_MS);
+    }
+
+    /* ---------------- 信令分发 ---------------- */
+
+    function handleSignal(payload) {
+      if (!payload || typeof payload !== 'object') return;
+      const from = payload.from;
+      const data = payload.data;
+      if (!data || typeof data !== 'object' || typeof data.transferId !== 'string') return;
+
+      const session = state.transfers.get(data.transferId);
+
+      if (!session) {
+        // 会话已经结束（比如对端点了取消），用 reject 告知，避免对端一直等
+        if (data.kind === 'offer' && typeof from === 'string') {
+          sendSignalTo(from, { kind: 'reject', transferId: data.transferId, reason: 'session_expired' });
+        }
+        return;
+      }
+      if (from && session.peerSocketId !== from) return; // 只接受对端本人的信令
+
+      switch (data.kind) {
+        case 'offer':
+          enqueue(session, () => acceptOffer(session, data));
+          break;
+        case 'answer':
+          enqueue(session, () => acceptAnswer(session, data));
+          break;
+        case 'candidate':
+          enqueue(session, () => acceptCandidate(session, data));
+          break;
+        case 'reject':
+          failTransfer(
+            session,
+            'rejected',
+            data.reason === 'busy' ? '对方正忙，请稍后再试'
+              : data.reason === 'file_unavailable' ? '对方已丢失原始文件，请让其重新发送'
+                : '对方拒绝了这次传输',
+          );
+          break;
+        case 'cancel':
+          failTransfer(session, 'canceled', '传输已被对方取消');
+          break;
+        default:
+          break;
+      }
+    }
+
+    function bindPeerEvents(session) {
+      const pc = session.pc;
+
+      pc.onicecandidate = (event) => {
+        if (!event.candidate) return;
+        sendSignal(session, {
+          kind: 'candidate',
+          transferId: session.id,
+          candidate: typeof event.candidate.toJSON === 'function' ? event.candidate.toJSON() : event.candidate,
+        });
+      };
+
+      // 需求四.2：监听 iceConnectionState，给出明确提示
+      pc.oniceconnectionstatechange = () => {
+        const iceState = pc.iceConnectionState;
+        if (session.state === 'closed' || session.state === 'failed') return;
+
+        if (iceState === 'connected' || iceState === 'completed') {
+          clearTimeout(session.connectTimer);
+          session.lastRxAt = Date.now();
+          return;
+        }
+        if (iceState === 'disconnected') {
+          paintCard(session.fileId, {
+            text: '网络波动，P2P 连接正在尝试重连…',
+            tone: 'warn',
+            progress: null,
+          });
+          return;
+        }
+        if (iceState === 'failed') {
+          // 双方都对称 NAT 时会走到这里：STUN 打得穿是缘分，打不穿只能提示
+          if (session.role === 'receiver' && session.iceRestarts < MAX_ICE_RESTARTS) {
+            tryIceRestart(session);
+            return;
+          }
+          failTransfer(session, 'ice_failed', STRICT_NETWORK_HINT);
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        const connState = pc.connectionState;
+        if (session.state === 'closed' || session.state === 'failed') return;
+        if (connState === 'failed') {
+          if (session.role === 'receiver' && session.iceRestarts < MAX_ICE_RESTARTS) {
+            tryIceRestart(session);
+            return;
+          }
+          failTransfer(session, 'ice_failed', STRICT_NETWORK_HINT);
+        }
+        if (connState === 'closed' && session.state !== 'closed') {
+          failTransfer(session, 'closed', 'P2P 连接已关闭');
+        }
+      };
+    }
+
+    /* ---------------- 协商 ---------------- */
+
+    async function acceptOffer(session, data) {
+      if (session.state === 'closed' || session.state === 'failed' || session.done) return;
+      if (!data.sdp) return;
+
+      if (!session.pc) {
+        // 发送方：等对方 offer 到了才创建 PeerConnection
+        const pc = new RTCPeerConnection(rtcConfiguration());
+        session.pc = pc;
+        pc.ondatachannel = (event) => {
+          session.dc = event.channel;
+          wireDataChannel(session);
+        };
+        bindPeerEvents(session);
+      }
+
+      const pc = session.pc;
+      await pc.setRemoteDescription(data.sdp);
+      await flushPendingCandidates(session);
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      sendSignal(session, {
+        kind: 'answer',
+        transferId: session.id,
+        sdp: pc.localDescription,
+      });
+      session.state = 'connecting';
+    }
+
+    async function acceptAnswer(session, data) {
+      if (session.state === 'closed' || session.state === 'failed' || session.done) return;
+      if (!session.pc || !data.sdp) return;
+      // 只有"我"还没拿到远端描述时才需要 setRemoteDescription
+      if (session.pc.signalingState === 'stable') return;
+      await session.pc.setRemoteDescription(data.sdp);
+      await flushPendingCandidates(session);
+    }
+
+    async function acceptCandidate(session, data) {
+      if (!data.candidate) return;
+      if (session.state === 'closed' || session.state === 'failed') return;
+      if (!session.pc) return;
+      if (!session.pc.remoteDescription) {
+        session.pendingCandidates.push(data.candidate);
+        return;
+      }
+      try {
+        await session.pc.addIceCandidate(data.candidate);
+      } catch (error) {
+        // 迟到的 candidate 很正常，忽略即可
+        console.debug('[rtc] 忽略无效 candidate', error?.message);
+      }
+    }
+
+    async function flushPendingCandidates(session) {
+      const pending = session.pendingCandidates;
+      session.pendingCandidates = [];
+      for (const candidate of pending) {
+        try {
+          await session.pc.addIceCandidate(candidate);
+        } catch {
+          /* 忽略 */
+        }
+      }
+    }
+
+    /* ---------------- DataChannel ---------------- */
+
+    function wireDataChannel(session) {
+      const dc = session.dc;
+      if (!dc) return;
+      dc.binaryType = 'arraybuffer';
+
+      dc.onopen = () => {
+        clearTimeout(session.connectTimer);
+        session.lastRxAt = Date.now();
+        session.startedAt = Date.now();
+        session.state = session.role === 'sender' ? 'sending' : 'receiving';
+
+        paintCard(session.fileId, {
+          text: session.role === 'sender' ? '已建立 P2P 直连，正在发送…' : '已建立 P2P 直连，正在接收…',
+          tone: 'active',
+          progress: 0,
+          buttonLabel: session.role === 'sender' ? undefined : '取消',
+          buttonHidden: session.role === 'sender',
+        });
+
+        startHeartbeat(session);
+        if (session.role === 'sender') startSending(session);
+      };
+
+      dc.onclose = () => {
+        if (session.done || session.state === 'closed' || session.state === 'failed') return;
+        failTransfer(session, 'closed', 'P2P 连接中断，传输失败');
+      };
+
+      dc.onerror = (event) => {
+        // 传输收尾阶段的对端关闭常会附带一次 error 事件，属于拆除噪声，不应报错；
+        // 真正的中断由 onclose 统一处理，这里只留一条可诊断的 warn
+        if (session.done || session.state === 'closed' || session.state === 'failed') return;
+        const detail = event?.error?.message || event?.error?.name || '未知错误';
+        console.warn('[rtc] datachannel error:', detail);
+      };
+
+      dc.onmessage = (event) => {
+        session.lastRxAt = Date.now();
+        if (session.role === 'receiver') onReceiverMessage(session, event);
+        else onSenderMessage(session, event);
+      };
+    }
+
+    /* ---------------- 心跳与 ICE 重启（需求四.3） ---------------- */
+
+    function startHeartbeat(session) {
+      clearInterval(session.heartbeat);
+      session.heartbeat = setInterval(() => {
+        if (session.state === 'closed' || session.state === 'failed' || session.done) return;
+        const dc = session.dc;
+        if (!dc || dc.readyState !== 'open') return;
+
+        // 接收方每个心跳周期发一次 ping，发送方回 pong，用来判断链路是否还活着
+        if (session.role === 'receiver') {
+          try {
+            dc.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+          } catch {
+            /* 通道正忙，下一个周期再试 */
+          }
+        }
+
+        const idle = Date.now() - session.lastRxAt;
+        if (idle <= STALL_TIMEOUT_MS) return;
+
+        if (session.role === 'receiver' && session.iceRestarts < MAX_ICE_RESTARTS) {
+          tryIceRestart(session);
+        } else if (session.role === 'sender') {
+          // 发送方无法主动重协商（offer 方是下载方），只能等对端 ICE 重启
+          paintCard(session.fileId, { text: '链路静默，正在等待对方重连…', tone: 'warn', progress: null });
+        } else {
+          failTransfer(session, 'stalled', '传输长时间无响应，网络环境可能过于严格');
+        }
+      }, HEARTBEAT_MS);
+    }
+
+    async function tryIceRestart(session) {
+      if (session.role !== 'receiver' || !session.pc) return;
+      if (session.iceRestarts >= MAX_ICE_RESTARTS) return;
+      if (session.pc.signalingState !== 'stable') return;
+
+      session.iceRestarts += 1;
+      session.lastRxAt = Date.now(); // 给新一轮打洞留出时间窗口
+      paintCard(session.fileId, {
+        text: `网络波动，正在进行第 ${session.iceRestarts} 次打洞重连…`,
+        tone: 'warn',
+        progress: null,
+      });
+
+      try {
+        session.pc.restartIce();
+        const offer = await session.pc.createOffer({ iceRestart: true });
+        await session.pc.setLocalDescription(offer);
+        sendSignal(session, {
+          kind: 'offer',
+          transferId: session.id,
+          fileId: session.fileId,
+          iceRestart: true,
+          sdp: session.pc.localDescription,
+        });
+      } catch (error) {
+        console.error('[rtc] ICE 重启失败', error);
+        failTransfer(session, 'ice_failed', STRICT_NETWORK_HINT);
+      }
+    }
+
+    /* ---------------- 发送侧：16KB 分片 + 背压 ---------------- */
+
+    async function startSending(session) {
+      const { file, dc } = session;
+      session.startedAt = Date.now();
+      session.sent = 0;
+
+      try {
+        // 先发一条控制消息说明文件身份，接收方据此校验
+        dc.send(JSON.stringify({
+          type: 'meta',
+          fileId: session.fileId,
+          name: session.fileName,
+          size: session.size,
+          mime: session.mime,
+        }));
+
+        let offset = 0;
+        while (offset < session.size) {
+          if (session.state === 'closed' || session.state === 'failed') return;
+          if (dc.readyState !== 'open') throw new Error('数据通道已关闭');
+
+          // 背压：缓冲区堆积太多就先等它排空，否则大文件会把发送端内存打爆
+          while (dc.bufferedAmount > BUFFER_HIGH_WATER) {
+            if (session.state === 'closed' || session.state === 'failed') return;
+            if (dc.readyState !== 'open') throw new Error('数据通道已关闭');
+            await sleep(30);
+          }
+
+          const buffer = await file.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
+          dc.send(buffer);
+          offset += buffer.byteLength;
+          session.sent = offset;
+          paintProgress(session);
+        }
+
+        dc.send(JSON.stringify({ type: 'done', size: session.size }));
+        session.done = true;
+        clearInterval(session.heartbeat);
+
+        paintCard(session.fileId, {
+          text: `发送完成 · ${formatBytes(session.size)}`,
+          tone: 'ok',
+          progress: 1,
+          buttonHidden: true,
+        });
+
+        // 留一点时间让对方收完最后几个包，再拆连接
+        setTimeout(() => closeSession(session), 8000);
+      } catch (error) {
+        if (session.state === 'closed' || session.state === 'failed') return;
+        console.error('[sender] 发送失败', error);
+        failTransfer(session, 'send_error', `发送中断：${error?.message || '未知错误'}`);
+      }
+    }
+
+    function paintProgress(session) {
+      const now = Date.now();
+      if (now - session.lastPaintAt < 120) return;
+      session.lastPaintAt = now;
+
+      const total = session.size || 1;
+      const done = session.role === 'sender' ? session.sent : session.received;
+      const elapsed = Math.max(0.2, (now - session.startedAt) / 1000);
+      const speed = done / elapsed;
+
+      paintCard(session.fileId, {
+        progress: Math.min(1, done / total),
+        tone: 'active',
+        text: `${session.role === 'sender' ? '发送中' : '接收中'} ${formatBytes(done)} / ${formatBytes(total)} · ${formatBytes(speed)}/s`,
+      });
+    }
+
+    /* ---------------- 接收侧：拼装并触发下载 ---------------- */
+
+    function onReceiverMessage(session, event) {
+      const data = event.data;
+
+      if (typeof data === 'string') {
+        let control;
+        try {
+          control = JSON.parse(data);
+        } catch {
+          return;
+        }
+        if (control.type === 'meta') {
+          session.fileName = control.name || session.fileName;
+          session.size = Number(control.size) || session.size;
+          session.mime = control.mime || session.mime;
+          return;
+        }
+        if (control.type === 'done') {
+          finalizeDownload(session);
+          return;
+        }
+        if (control.type === 'ping') {
+          try {
+            session.dc.send(JSON.stringify({ type: 'pong', t: control.t }));
+          } catch { /* 忽略 */ }
+        }
+        return;
+      }
+
+      if (!(data instanceof ArrayBuffer)) return;
+      session.chunks.push(data);
+      session.received += data.byteLength;
+      paintProgress(session);
+    }
+
+    function onSenderMessage(session, event) {
+      if (typeof event.data !== 'string') return;
+      let control;
+      try {
+        control = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (control.type === 'ping') {
+        try {
+          session.dc.send(JSON.stringify({ type: 'pong', t: control.t }));
+        } catch { /* 忽略 */ }
+      }
+    }
+
+    function finalizeDownload(session) {
+      if (session.done) return;
+      session.done = true;
+      clearInterval(session.heartbeat);
+
+      const total = session.received;
+      const blob = new Blob(session.chunks, { type: session.mime || 'application/octet-stream' });
+      session.chunks = [];
+
+      try {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = session.fileName || 'download';
+        link.rel = 'noopener';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        // 给浏览器留出读取 Blob 的时间，再释放 URL
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      } catch (error) {
+        console.error('[receiver] 触发下载失败', error);
+        toast('浏览器阻止了自动下载，请检查浏览器设置', 'error');
+      }
+
+      const seconds = Math.max(0.2, (Date.now() - session.startedAt) / 1000);
+      paintCard(session.fileId, {
+        text: `接收完成 · ${formatBytes(total)}（${formatBytes(total / seconds)}/s）`,
+        tone: 'ok',
+        progress: 1,
+        buttonLabel: '再次下载',
+        buttonHidden: false,
+        buttonDisabled: false,
+      });
+      toast(`已接收 ${session.fileName}（${formatBytes(total)}）`, 'success');
+
+      closeSession(session);
+    }
+
+    /* ---------------- 收尾 ---------------- */
+
+    function failTransfer(session, code, message) {
+      if (!session || session.state === 'closed' || session.state === 'failed') return;
+      session.state = 'failed';
+      clearInterval(session.heartbeat);
+      clearTimeout(session.connectTimer);
+      teardownPeer(session);
+      state.transfers.delete(session.id);
+
+      const isReceiver = session.role === 'receiver';
+      paintCard(session.fileId, {
+        text: message,
+        tone: 'error',
+        progress: null,
+        buttonLabel: isReceiver ? '重试' : undefined,
+        buttonHidden: isReceiver ? false : true,
+        buttonDisabled: false,
+      });
+
+      toast(message, 'error');
+      if (code === 'ice_failed' || code === 'connect_timeout' || code === 'stalled') {
+        toast(STRICT_NETWORK_HINT, 'warn', 6000);
+      }
+    }
+
+    function closeSession(session) {
+      if (!session || session.state === 'closed') return;
+      session.state = 'closed';
+      clearInterval(session.heartbeat);
+      clearTimeout(session.connectTimer);
+      teardownPeer(session);
+      state.transfers.delete(session.id);
+    }
+
+    function teardownPeer(session) {
+      try {
+        if (session.dc && session.dc.readyState !== 'closed') session.dc.close();
+      } catch { /* 忽略 */ }
+      try {
+        session.pc?.close();
+      } catch { /* 忽略 */ }
+      session.dc = null;
+      session.pc = null;
+      session.chunks = [];
+      session.pendingCandidates = [];
+    }
+
+    function cancelTransfer(session) {
+      try {
+        sendSignal(session, { kind: 'cancel', transferId: session.id });
+      } catch { /* 忽略 */ }
+      const fileId = session.fileId;
+      closeSession(session);
+      paintCard(fileId, {
+        text: '已取消，可重新点击下载',
+        tone: 'idle',
+        progress: null,
+        buttonLabel: '下载',
+        buttonHidden: false,
+        buttonDisabled: false,
+      });
+    }
+
+    function closeAllTransfers() {
+      for (const session of [...state.transfers.values()]) closeSession(session);
+    }
+
+    /* ================================================================
+     * 3.14 事件绑定
+     * ================================================================ */
+
+    function bindUiEvents() {
+      // ---- 首页 ----
+      $('#input-name').addEventListener('input', (event) => {
+        const value = event.target.value.replace(/[\u0000-\u001f]/g, '').slice(0, 20);
+        saveName(value);
+      });
+
+      $('#btn-create').addEventListener('click', createRoomFlow);
+      $('#btn-enter').addEventListener('click', enterRoomFlow);
+
+      // 口令输入：防抖自动校验；回车立即校验，已通过则直接进入/创建
+      const accessInput = $('#input-access');
+      accessInput.addEventListener('input', onAccessInput);
+      accessInput.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        clearTimeout(accessVerifyTimer);
+        if (state.accessVerified) {
+          if (targetRoomId()) enterRoomFlow();
+          else createRoomFlow();
+        } else {
+          verifyAccessCode();
+        }
+      });
+
+      // 手填房间号：回车 = 进入房间；输入时同步「进入房间」的可用状态
+      $('#input-room').addEventListener('input', syncEnterButton);
+      $('#input-room').addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          enterRoomFlow();
+        }
+      });
+
+      // ---- 聊天室 ----
+      $('#btn-send').addEventListener('click', sendText);
+
+      const input = $('#input-message');
+      input.addEventListener('input', () => {
+        autoGrow();
+        signalTyping();
+        $('#btn-send').disabled = !input.value.trim();
+      });
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          sendText();
+        }
+      });
+      input.addEventListener('blur', stopTypingSignal);
+
+      $('#btn-attach').addEventListener('click', () => $('#file-input').click());
+      $('#file-input').addEventListener('change', (event) => {
+        sendFiles(event.target.files);
+        event.target.value = '';
+      });
+
+      $('#btn-copy-link').addEventListener('click', async () => {
+        if (!state.room) return;
+        const link = `${window.location.origin}${window.location.pathname}?room=${state.room.id}`;
+        try {
+          await navigator.clipboard.writeText(link);
+          toast('邀请链接已复制（对方仍需输入暗号）', 'success');
+        } catch {
+          // 非 https 或权限被拒时的兜底
+          const helper = el('textarea', 'fixed left-[-9999px] top-0');
+          helper.value = link;
+          document.body.appendChild(helper);
+          helper.select();
+          try {
+            document.execCommand('copy');
+            toast('邀请链接已复制（对方仍需输入暗号）', 'success');
+          } catch {
+            toast(`复制失败，请手动分享：${link}`, 'warn', 8000);
+          }
+          helper.remove();
+        }
+      });
+
+      $('#btn-leave').addEventListener('click', leaveRoomFlow);
+
+      $('#btn-members').addEventListener('click', () => setMemberPanel(true));
+      $('#drawer-backdrop').addEventListener('click', () => setMemberPanel(false));
+
+      // ---- 粘贴文件 ----
+      document.addEventListener('paste', (event) => {
+        if (!state.room) return;
+        const files = Array.from(event.clipboardData?.files || []);
+        if (!files.length) return;
+        // 输入框里粘贴纯文本时不要拦
+        event.preventDefault();
+        sendFiles(files);
+      });
+
+      // ---- 拖拽文件 ----
+      const overlay = $('#drop-overlay');
+      let dragDepth = 0;
+      document.addEventListener('dragenter', (event) => {
+        if (!state.room) return;
+        if (!event.dataTransfer?.types?.includes('Files')) return;
+        dragDepth += 1;
+        overlay.classList.remove('hidden');
+        overlay.classList.add('flex');
+      });
+      document.addEventListener('dragleave', () => {
+        dragDepth = Math.max(0, dragDepth - 1);
+        if (dragDepth === 0) {
+          overlay.classList.add('hidden');
+          overlay.classList.remove('flex');
+        }
+      });
+      document.addEventListener('dragover', (event) => {
+        if (state.room) event.preventDefault();
+      });
+      document.addEventListener('drop', (event) => {
+        if (!state.room) return;
+        event.preventDefault();
+        dragDepth = 0;
+        overlay.classList.add('hidden');
+        overlay.classList.remove('flex');
+        const files = Array.from(event.dataTransfer?.files || []);
+        if (files.length) sendFiles(files);
+      });
+
+      // ---- 关页面前提醒正在传输 ----
+      window.addEventListener('beforeunload', (event) => {
+        const active = [...state.transfers.values()].some((s) => !s.done && s.state !== 'failed' && s.state !== 'closed');
+        if (!active) return;
+        event.preventDefault();
+        event.returnValue = '文件还在传输中，离开会中断 P2P 连接。';
+        return event.returnValue;
+      });
+    }
+
+    function setMemberPanel(open) {
+      const panel = $('#member-panel');
+      const backdrop = $('#drawer-backdrop');
+      if (open) {
+        panel.classList.remove('hidden');
+        panel.classList.add('flex', 'fixed', 'inset-y-0', 'right-0', 'z-40', 'w-72', 'shadow-2xl');
+        backdrop.classList.remove('hidden');
+      } else {
+        panel.classList.add('hidden');
+        panel.classList.remove('flex', 'fixed', 'inset-y-0', 'right-0', 'z-40', 'w-72', 'shadow-2xl');
+        backdrop.classList.add('hidden');
+      }
+    }
+
+    /* ================================================================
+     * 3.15 启动：先挂首页闸门，口令验对后才谈房间
+     *
+     * 序列：
+     *   1. 读身份（昵称 / userId）+ 清掉旧版本残留的房间暗号缓存
+     *   2. 建 socket 连接
+     *   3. 渲染首页闸门：?room=xxx 会自动带进房间号，否则让用户手填
+     *   4. 用户输入口令 -> access:verify 通过 -> 两个按钮出现
+     * ================================================================ */
+
+    async function boot() {
+      loadIdentity();
+      purgeLegacySecrets();
+      renderIdentity();
+      bindUiEvents();
+      connectSocket();
+
+      // 邀请链接里的房间号：合法就记住（闸门显示成标签），不合法就清掉并提示
+      const params = new URLSearchParams(window.location.search);
+      const rawRoom = params.get('room');
+      if (rawRoom !== null) {
+        const roomId = normalizeRoomIdClient(rawRoom);
+        if (!roomId) {
+          toast('邀请链接里的房间号不合法，已忽略', 'error', 5000);
+        } else {
+          state.invitedRoomId = roomId;
+          if (roomId !== rawRoom) syncUrl(roomId); // 顺手把 URL 规范成 room_xxx 形式
+        }
+      }
+
+      showHome();
+      state.booted = true;
+
+      // 桌面端直接把焦点放进口令框，省一次点击；移动端不弹键盘
+      if (window.innerWidth > 640) {
+        setTimeout(() => $('#input-access').focus(), 120);
+      }
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', boot, { once: true });
+    } else {
+      boot();
+    }
+  })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,130 @@
+# =============================================================================
+#  Nginx 反向代理示例（对外 80/443 -> 宿主机 127.0.0.1:3001 -> 容器 3000）
+#  ---------------------------------------------------------------------------
+#  放置位置：/etc/nginx/conf.d/burn-chat.conf
+#  校验并重载：nginx -t && nginx -s reload
+#
+#  ⚠ WebSocket 三件套（缺一不可，下面用 ★ 标注）
+#    1) proxy_http_version 1.1;
+#    2) proxy_set_header Upgrade $http_upgrade;
+#    3) proxy_set_header Connection $connection_upgrade;
+#  浏览器发起的是 "Connection: Upgrade"，而 Nginx 代理默认用 HTTP/1.0 且会重写
+#  Connection 头；不显式透传就会退化成轮询，或者握手直接 400。
+# =============================================================================
+
+# 上游：compose.yaml 把容器 3000 映射到了宿主机 127.0.0.1:3001
+upstream burn_chat_upstream {
+    server 127.0.0.1:3001;
+    keepalive 32;
+}
+
+# ★ 按请求是否带 Upgrade 头，动态决定 Connection 的取值
+#   普通请求 -> close；WebSocket 握手 -> upgrade
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    # 配好证书后把下面两行换成 443 的两行（本文件末尾有说明）
+    listen      80;
+    listen      [::]:80;
+    server_name chat.example.com;
+
+    # listen 443 ssl;
+    # listen [::]:443 ssl;
+    # http2 on;
+    # ssl_certificate     /etc/letsencrypt/live/chat.example.com/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/chat.example.com/privkey.pem;
+    # ssl_protocols       TLSv1.2 TLSv1.3;
+
+    # 页面与信令都很小（SDP / candidate 只有几 KB），文件本体走 P2P 不经过这里
+    client_max_body_size 1m;
+    client_body_timeout  15s;
+
+    # 基础安全响应头（应用自身也会带一份）
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy       no-referrer always;
+
+    # -------------------------------------------------------------------------
+    #  1) Socket.io 专用入口
+    #     用更长前缀优先匹配，单独设置超时与缓冲策略
+    # -------------------------------------------------------------------------
+    location /socket.io/ {
+        proxy_pass         http://burn_chat_upstream;
+
+        proxy_http_version 1.1;                            # ★ 1) WebSocket 必须 1.1
+        proxy_set_header   Upgrade    $http_upgrade;       # ★ 2) 透传 upgrade 令牌
+        proxy_set_header   Connection $connection_upgrade; # ★ 3) 动态 connection
+
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+
+        # 长连接：默认 60s 会把空闲 WebSocket 掐断，客户端只能反复重连
+        proxy_read_timeout    3600s;
+        proxy_send_timeout    3600s;
+        proxy_connect_timeout 10s;
+
+        # 事件流要实时，不能攒包
+        proxy_buffering off;
+        proxy_cache     off;
+    }
+
+    # -------------------------------------------------------------------------
+    #  2) 页面本身
+    # -------------------------------------------------------------------------
+    location / {
+        proxy_pass         http://burn_chat_upstream;
+
+        # 这里同样保留三件套：首屏与轮询请求可能复用同一连接
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    $http_upgrade;
+        proxy_set_header   Connection $connection_upgrade;
+
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+
+        # index.html 由应用标记为 no-store，这里不要覆盖缓存策略
+        proxy_read_timeout 60s;
+    }
+
+    # -------------------------------------------------------------------------
+    #  3) 健康检查（只给本机 / 内网探测）
+    # -------------------------------------------------------------------------
+    location = /healthz {
+        allow 127.0.0.1;
+        allow 10.0.0.0/8;
+        deny  all;
+
+        proxy_pass       http://burn_chat_upstream;
+        proxy_set_header Host $host;
+    }
+}
+
+# =============================================================================
+#  启用 HTTPS 的两种做法（任选其一）
+#  ---------------------------------------------------------------------------
+#  A. 手动证书：把上面 server 块里的 listen 80 注释掉，改用 443 + ssl_certificate，
+#     并在最前面再加一个 80 的跳转块：
+#
+#        server {
+#            listen 80;
+#            server_name chat.example.com;
+#            return 301 https://$host$request_uri;
+#        }
+#
+#  B. certbot 一键签发（Nginx 插件会自动改好配置）：
+#        certbot --nginx -d chat.example.com
+#
+# =============================================================================
+#  关于 STUN / TURN —— Nginx 帮不上忙
+#  ---------------------------------------------------------------------------
+#  WebRTC 打洞走 UDP（stun:piik.siyin.fun:3478），不经过 HTTP 反向代理。
+#  要让自建 STUN 可用，需在部署它的机器上放行 UDP 3478（TURN 还要放行
+#  TCP 3478 与 UDP 49152-65535 中继端口），这与本 Nginx 配置无关。
+#  只想快速验证连通性时，可临时改用 stun:stun.l.google.com:19302。
+# =============================================================================

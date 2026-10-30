@@ -1,0 +1,14 @@
+# 统一换行符：仓库里一律 LF
+# Dockerfile 的 \ 续行一旦变成 CRLF 会让 docker build 直接报错，
+# 所以即便在 Windows 上 clone，也不让 autocrlf 把工作区改成 CRLF。
+* text=auto eol=lf
+
+# 二进制文件不要做换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.zip binary
+*.gz binary
