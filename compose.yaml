@@ -1,10 +1,13 @@
 # =============================================================================
-#  阅后即焚 · P2P 私密聊天室 —— 一键部署
+#  Ghost Drop · 阅后即焚的 P2P 私密聊天室 —— 一键部署
 #  ---------------------------------------------------------------------------
-#  0. 先定一个服务口令（不设也行，容器会随机生成并打在日志里）：
-#        export ACCESS_CODE='你的口令'         # Linux / macOS
-#        $env:ACCESS_CODE='你的口令'           # PowerShell
-#     也可以用同目录的 .env 文件写一行：ACCESS_CODE=你的口令
+#  0. 复制配置模板，按需改两项（不设口令也行，容器会随机生成并打在日志里）：
+#        cp .env.example .env                 # Linux / macOS
+#        Copy-Item .env.example .env          # PowerShell
+#     然后编辑 .env：
+#        ACCESS_CODE=你的口令
+#        STUN_URLS=stun:你的服务器:3478,stun:stun.l.google.com:19302
+#     compose 会自动读取同目录的 .env，前端通过 GET /api/config 拿到 STUN 列表。
 #  1. 启动：docker compose up -d --build
 #  2. 查看：docker compose ps / docker compose logs -f
 #  3. 停止：docker compose down
@@ -22,8 +25,8 @@ services:
       args:
         # 国内网络可执行：NPM_REGISTRY=https://registry.npmmirror.com docker compose build
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
-    image: burn-chat:1.0.0
-    container_name: burn-chat
+    image: ghost-drop:2.0.0
+    container_name: ghost-drop
     restart: unless-stopped
 
     ports:
@@ -34,10 +37,17 @@ services:
       NODE_ENV: production
       PORT: "3000"
       HOST: 0.0.0.0
+
       # ---- 服务级访问口令：全站唯一的「暗号」，不写死在代码里 ----
       # 留空则回退到 /app/access-code.txt，再没有就随机生成（见 docker compose logs）
       ACCESS_CODE: ${ACCESS_CODE:-}
       ACCESS_CODE_FILE: /app/access-code.txt
+
+      # ---- ICE / STUN 服务器 ----
+      # 逗号分隔，支持 stun: / stuns: / turn: / turns:
+      # 前端启动时 GET /api/config 拿到这份列表，再据此构造 RTCPeerConnection。
+      # 留空则用 server.js 的默认值 stun:stun.l.google.com:19302
+      STUN_URLS: ${STUN_URLS:-}
 
     # 想用「文件放口令」的方式时，把下面两行取消注释：
     #   宿主机 ./access-code.txt 里的第一行非空内容就是口令

@@ -14,13 +14,17 @@
  *  3. 阅后即焚：房间内最后一个 socket 断开时，立即 delete 该房间对象
  *     （消息、成员一起被垃圾回收），后续再用旧链接进入只会得到
  *     `room_not_found`，由前端决定是重建还是放弃。
- *  4. 阅后即焚：房间内最后一个 socket 断开时，立即 delete 该房间对象
- *     （消息、成员一起被垃圾回收），后续再用旧链接进入只会得到
- *     `room_not_found`，由前端决定是重建还是放弃。
- *  5. 文本流：Socket.io 中转；每条房间只保留最新 50 条，新加入者随 join ack
+ *  4. 文本流：Socket.io 中转；每条房间只保留最新 50 条，新加入者随 join ack
  *     一次性拿到历史（含文件卡片元数据，不含文件本体）。
- *  6. 安全过滤：广播前用极简 badWords 列表做替换，命中字符变成 *，
+ *  5. 安全过滤：广播前用极简 badWords 列表做替换，命中字符变成 *，
  *     并在消息里带 `filtered` 标记供前端提示。
+ *  6. 配置解耦：ICE/STUN 不写死在前端，由 STUN_URLS 环境变量注入，
+ *     前端通过 GET /api/config 拿到数组后再构建 RTCPeerConnection。
+ *
+ *  HTTP 接口
+ *    GET /            单页应用（index.html，永不缓存）
+ *    GET /healthz     健康检查（容器 healthcheck 用）
+ *    GET /api/config  {stunUrls: string[]}  前端运行时配置
  *
  *  P2P 文件传输里服务器只有一个职责：**信令中继**。
  *    客户端 A（下载方）  --file:request--> 服务器 --file:request--> 客户端 B（发送方）
@@ -56,6 +60,17 @@ const http = require('http');
 const express = require('express');
 const { Server } = require('socket.io');
 
+/**
+ * 读取项目根目录下的 .env（本地开发方便）。
+ * 容器里通常通过 compose 的 environment 注入，不存在 .env 也没关系；
+ * dotenv 没装时也不该让服务起不来，所以这里用 try 兜住。
+ */
+try {
+  require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
+} catch (error) {
+  // dotenv 是可选依赖：没装就跳过，只用真实的环境变量
+}
+
 /** 带时间戳的日志（唯一输出通道：stdout；不落文件） */
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
@@ -65,6 +80,35 @@ const log = (...args) => console.log(new Date().toISOString(), ...args);
 
 const PORT = Number.parseInt(process.env.PORT ?? '3000', 10);
 const HOST = process.env.HOST ?? '0.0.0.0';
+
+/* --------------------------------------------------------------------------
+ * ICE / STUN 配置（架构解耦：写死的 STUN 抽到这里，前端只负责消费）
+ *
+ * 需求：从 STUN_URLS 读取，缺省 stun:stun.l.google.com:19302；
+ *      逗号分隔可配多个，前端用 GET /api/config 拉取后动态构建 iceServers。
+ *
+ * 这样换 STUN（自建 coturn、Cloudflare、Twilio 的 TURN…）只改环境变量，
+ * 不用重新构建前端，也不需要动一行代码。
+ * -------------------------------------------------------------------------- */
+
+const DEFAULT_STUN_URLS = ['stun:stun.l.google.com:19302'];
+const MAX_STUN_URLS = 8; // 上限：iceServers 塞太多只会拖慢候选收集
+
+/**
+ * 把 "stun:a, stun:b" 解析成 ['stun:a', 'stun:b']。
+ * 容错：空串、多余逗号、非 stun/stuns/turn 协议的项一律丢掉。
+ * @param {string|undefined} raw
+ * @returns {string[]}
+ */
+function parseStunUrls(raw) {
+  const list = String(raw ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => /^(stuns?|turns?):[^\s,]+$/i.test(item));
+  return list.length ? list.slice(0, MAX_STUN_URLS) : DEFAULT_STUN_URLS.slice();
+}
+
+const STUN_URLS = parseStunUrls(process.env.STUN_URLS);
 
 const MAX_HISTORY = 50; // 每个房间只保留最新 50 条消息
 const MAX_TEXT_LENGTH = 2000; // 单条文本上限（字符数）
@@ -478,6 +522,21 @@ app.get('/healthz', (_req, res) => {
   res.json({ ok: true, uptime: Math.round(process.uptime()), rooms: rooms.size });
 });
 
+/**
+ * 前端运行时配置（目前只有 ICE 服务器）。
+ *
+ * 为什么要走后端下发而不是前端写死：
+ *   - STUN/TURN 换地址不用重新构建、甚至不用重启前端；
+ *   - 将来要加 TURN 的 username/credential 时，这些凭据也不该出现在静态文件里。
+ *
+ * 注意：这里没有敏感信息（STUN 地址本身就是公开的），所以不加鉴权；
+ *      但如果以后要下发 TURN 凭据，记得先过一遍口令校验 / 短时效签名。
+ */
+app.get('/api/config', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ stunUrls: STUN_URLS });
+});
+
 app.get('/', serveIndex);
 
 // SPA 式回退：无扩展名的路径都交给前端（例如误加的 /room）
@@ -793,6 +852,7 @@ sweeper.unref();
 server.listen(PORT, HOST, () => {
   log(`[boot] 聊天室已启动 http://${HOST}:${PORT} （内存模式，不落盘）`);
   log('[boot] 准入：必须输入正确的服务口令才能创建/加入房间');
+  log(`[boot] ICE：${STUN_URLS.length} 个 STUN（GET /api/config 下发）→ ${STUN_URLS.join(', ')}`);
 });
 
 function shutdown(signal) {
