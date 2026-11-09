@@ -855,6 +855,19 @@
     .file-status[data-tone="warn"] { color: var(--warn); }
     .file-status[data-tone="error"] { color: var(--danger); }
 
+    /* 连接类型：局域网直连 / 公网 P2P 直连 / 正在握手… （等宽小字，不抢主信息） */
+    .file-route {
+      margin-top: 7px;
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+
+    .file-route[data-tone="ok"] { color: var(--ok); }
+    .file-route[data-tone="warn"] { color: var(--warn); }
+    .file-route[data-tone="error"] { color: var(--danger); }
+
     /* 正在输入 */
     .typing {
       height: 20px;
@@ -1264,7 +1277,7 @@
             <h2>这里还没有消息</h2>
             <p>
               说点什么，或者把文件拖进来。文件不会上传到服务器，
-              点「下载」之后才会和对方建立 P2P 直连。
+              点「接收」之后才会和对方建立 P2P 直连。
             </p>
           </div>
         </div>
@@ -1299,7 +1312,7 @@
   <div id="drop-overlay" class="hidden">
     <div class="drop-frame">
       <p class="drop-title">释放以发送文件</p>
-      <p class="drop-note">只广播一张卡片，对方点「下载」后才建立 P2P 直连</p>
+      <p class="drop-note">只广播一张卡片，对方点「接收」后才建立 P2P 直连</p>
     </div>
   </div>
 
@@ -1338,9 +1351,11 @@
     const MAX_FILE_BYTES = 1024 * 1024 * 1024; // 单文件 1GB（浏览器端拼 Blob 的内存上限）
     const MAX_ACTIVE_SENDS = 3;                // 同时对外发送的文件数上限
     const HISTORY_LIMIT = 200;                 // 前端内存里最多保留的渲染条数
+    const HASH_FULL_LIMIT = 64 * 1024 * 1024;  // 超过 64MB 就不整份算哈希，改采样
+    const DISCONNECT_GRACE_MS = 6000;          // ICE disconnected 的宽限窗口
 
     /** 需求原文里的失败文案，集中一处，避免多处不一致 */
-    const STRICT_NETWORK_HINT = '网络环境严格，P2P 连接失败，请确保双方网络未被严格限制';
+    const P2P_FAILED_HINT = 'P2P 连接失败，请确保网络通畅';
 
     const LS_NAME = 'burnchat:name';
     const LS_USER_ID = 'burnchat:userId';
@@ -1387,6 +1402,12 @@
       files: new Map(),
       /** @type {Map<string, Object>} transferId -> 传输会话 */
       transfers: new Map(),
+      /**
+       * 按需建连的「防冲突表」：key = `接收方socketId|fileId`。
+       * 同一个文件对同一个接收方永远只允许一条 RTCPeerConnection / DataChannel。
+       * @type {Map<string, Object>}
+       */
+      activeConnections: new Map(),
       /** @type {Map<string, Object>} fileId -> 卡片 DOM 引用 */
       cards: new Map(),
       typingName: '',
@@ -1724,7 +1745,8 @@
         showTyping(payload.isTyping ? payload.userName : '');
       });
 
-      socket.on('file:request', (payload) => handleFileRequest(payload));
+      /* 接收方点了「接收」→ 服务器转发过来的建连请求（按需建连的入口） */
+      socket.on('request_transfer', (payload) => handleTransferRequest(payload));
 
       socket.on('signal', (payload) => handleSignal(payload));
     }
@@ -1907,7 +1929,7 @@
     }
 
     /**
-     * 文件块：图标 + 文件名 + 大小 + 文本按钮 + 进度条 + 状态行。
+     * 文件块：图标 + 文件名 + 大小 + 文本按钮 + 进度条 + 连接类型 + 状态行。
      * 只有 1px 边框和一条极细的进度条，不用阴影和渐变。
      */
     function buildFileCard(message, mine) {
@@ -1922,11 +1944,13 @@
 
       const meta = el('div', 'file-meta');
       meta.appendChild(el('div', 'file-name', file.name));
-      meta.appendChild(el('div', 'file-size', `${formatBytes(file.size)}${file.mime ? ` · ${file.mime.split('/')[0]}` : ''}`));
+      const metaText = `${formatBytes(file.size)}${file.mime ? ` · ${file.mime.split('/')[0]}` : ''}`;
+      // 指纹只露前 8 位，完整值留在消息里给接收方复核
+      meta.appendChild(el('div', 'file-size', file.hash ? `${metaText} · ${file.hash.slice(0, 8)}` : metaText));
       head.appendChild(meta);
 
-      // 自己的文件块不需要下载按钮（等对方点）；对方的给一个干净的文本按钮
-      const button = el('button', 'btn btn--ghost btn--sm', mine ? '等待' : '下载');
+      // 自己的文件块不需要接收按钮（等对方点）；对方的给一个干净的文本按钮
+      const button = el('button', 'btn btn--ghost btn--sm', mine ? '等待' : '接收');
       button.type = 'button';
       if (mine) button.disabled = true;
       head.appendChild(button);
@@ -1937,19 +1961,26 @@
       bar.appendChild(fill);
       card.appendChild(bar);
 
+      // 连接类型：握手阶段是「正在握手…」，通了之后是「局域网直连 / 公网 P2P 直连」
+      const route = el('div', 'file-route hidden', '');
+      card.appendChild(route);
+
       const foot = el('div', 'file-foot');
-      const status = el('span', 'file-status', mine ? '等待对方点击「下载」' : '点击「下载」建立 P2P 直连');
+      const status = el('span', 'file-status', mine ? '等对方点「接收」，才会建立直连' : '点「接收」后才会建立直连');
       const percent = el('span', 'file-percent', '');
       foot.appendChild(status);
       foot.appendChild(percent);
       card.appendChild(foot);
 
-      state.cards.set(file.fileId, { root: card, button, bar, fill, percent, status, message });
+      state.cards.set(file.fileId, { root: card, button, bar, fill, percent, status, route, message });
 
       button.addEventListener('click', () => {
         if (button.disabled) return;
-        const active = activeTransferForFile(file.fileId);
+        const active = activeReceiverSession(file.fileId);
         if (active) {
+          // 还没排上队（请求发出去、对方尚未应答）时不接受取消：连按钮都还没轮到「取消」，
+          // 否则一次双击就会点成「接收 + 取消」，白建一条连接
+          if (active.state === 'requesting') return;
           cancelTransfer(active);
           return;
         }
@@ -1957,6 +1988,20 @@
       });
 
       return card;
+    }
+
+    /**
+     * 连接类型那一行。
+     * @param {string} fileId
+     * @param {string} text   空字符串 = 隐藏
+     * @param {'idle'|'active'|'ok'|'warn'|'error'} [tone]
+     */
+    function setRoute(fileId, text, tone = 'idle') {
+      const card = state.cards.get(fileId);
+      if (!card?.route) return;
+      card.route.textContent = text || '';
+      card.route.dataset.tone = tone;
+      card.route.classList.toggle('hidden', !text);
     }
 
     /**
@@ -2422,19 +2467,27 @@
     }
 
     /* ================================================================
-     * 3.12 发送文件：只广播元数据卡片
+     * 3.12 发送文件：先在本地算指纹，再广播一张卡片
+     *
+     * 这一步**不建立任何 RTCPeerConnection**，也不上传字节：
+     * 房间里其他人只会收到一条带 fileId 的卡片消息；
+     * 文件本体留在发送方的内存里（state.files），等有人点「接收」才用得上。
      * ================================================================ */
 
     async function sendFiles(fileList) {
       const files = Array.from(fileList || []);
-      if (!files.length) return;
-      if (!state.room) return;
+      if (!files.length || !state.room) return;
 
       for (const file of files.slice(0, 8)) {
         if (file.size > MAX_FILE_BYTES) {
           toast(`${file.name} 超过 1GB，浏览器无法在内存中拼装`, 'error');
           continue;
         }
+
+        // 大文件的指纹要算一会儿，先给个提示，免得看起来像卡死
+        if (file.size > 8 * 1024 * 1024) toast(`正在计算 ${file.name} 的指纹…`, 'info', 2200);
+        const fingerprint = await fingerprintOf(file);
+
         const fileId = `f_${randHex(10)}`;
         state.files.set(fileId, file);
         const result = await emitAck('file:announce', {
@@ -2442,6 +2495,8 @@
           name: file.name || '未命名文件',
           size: file.size,
           mime: file.type || '',
+          hash: fingerprint.hash,
+          hashKind: fingerprint.kind,
         });
         if (!result.ok) {
           state.files.delete(fileId);
@@ -2450,14 +2505,63 @@
       }
     }
 
+    /**
+     * 文件指纹（哈希）。
+     * 小文件整份算 SHA-256；大文件只取头 / 中 / 尾各 1MB 再加总长度，
+     * 这样 1GB 的文件也不会被整份读进内存。接收端拼完 Blob 后用同一套规则复核。
+     * @param {File|Blob} source
+     * @returns {Promise<{hash: string, kind: 'sha256'|'sampled'|''}>}
+     */
+    async function fingerprintOf(source) {
+      const size = Number(source?.size) || 0;
+      if (!window.crypto?.subtle || !size) return { hash: '', kind: '' };
+      try {
+        if (size <= HASH_FULL_LIMIT) {
+          const buffer = await source.arrayBuffer();
+          return { hash: hexOf(await crypto.subtle.digest('SHA-256', buffer)), kind: 'sha256' };
+        }
+        const piece = 1024 * 1024;
+        const middle = Math.max(0, Math.floor(size / 2) - piece / 2);
+        const parts = [
+          await source.slice(0, piece).arrayBuffer(),
+          await source.slice(middle, middle + piece).arrayBuffer(),
+          await source.slice(Math.max(0, size - piece)).arrayBuffer(),
+          new TextEncoder().encode(`|${size}|`),
+        ];
+        const digest = await crypto.subtle.digest('SHA-256', new Blob(parts));
+        return { hash: hexOf(digest), kind: 'sampled' };
+      } catch (error) {
+        console.warn('[file] 计算指纹失败，退化为不校验', error);
+        return { hash: '', kind: '' };
+      }
+    }
+
+    function hexOf(buffer) {
+      return Array.from(new Uint8Array(buffer))
+        .map((byte) => byte.toString(16).padStart(2, '0'))
+        .join('');
+    }
+
     /* ================================================================
-     * 3.13 P2P 文件传输
+     * 3.13 P2P 文件传输：按需建连（On-Demand Connection）
+     *
+     * 设计要点（对应需求一）：
+     *   1. 进房间不建连：只保持 Socket.io 连接，任何 RTCPeerConnection 都要等到
+     *      「有人点了接收」才创建。
+     *   2. 文件广播：file:announce 只发元数据（名字 / 大小 / 哈希），不建连。
+     *   3. 请求触发：接收方 emit request_transfer（带 fileId / transferId / senderId）。
+     *   4. 点对点握手：**发送方**收到请求后，只针对这一个接收方新建 RTCPeerConnection，
+     *      自己 createDataChannel + createOffer；接收方收到 offer 才建自己的 PC 并回 answer。
+     *   5. 防冲突：state.activeConnections 以 `接收方socketId|fileId` 为键，
+     *      同一个文件对同一个接收方永远只有一条 DataChannel。
+     *
+     * 一条连接 = 一个 session。发送方可以同时服务多个接收方（默认上限 3 条）。
      * ================================================================ */
 
     function rtcConfiguration() {
       /**
        * iceServers 来自 /api/config（服务端 STUN_URLS 环境变量），前端不写死。
-       * 一份配置同时喂给收发双方，保证两边看到的 ICE 服务器是一致的。
+       * iceCandidatePoolSize 让浏览器提前并发收集 host / srflx 候选，握手更快。
        */
       return {
         iceServers: state.iceServers.map((server) => ({ ...server })),
@@ -2465,41 +2569,67 @@
       };
     }
 
+    /** 防冲突键：同一个接收方 + 同一个文件只允许一条连接 */
+    function connectionKey(peerSocketId, fileId) {
+      return `${peerSocketId}|${fileId}`;
+    }
+
     function createSession(options) {
       const session = {
-        id: options.transferId,
-        role: options.role,                 // 'sender' | 'receiver'
+        id: options.transferId,                                // t_xxx，信令路由用
+        key: connectionKey(options.peerSocketId, options.fileId),
+        role: options.role,                                    // 'sender' | 'receiver'
         fileId: options.fileId,
         peerSocketId: options.peerSocketId,
+        peerName: options.peerName || '对方',
         fileName: options.fileName || '未命名文件',
         size: Number(options.size) || 0,
         mime: options.mime || '',
-        file: options.file || null,
+        hash: options.hash || '',
+        hashKind: options.hashKind || '',
+        file: options.file || null,                            // 只有发送方手里有 File
         pc: null,
         dc: null,
-        state: 'new',                       // new|awaiting-offer|connecting|sending|receiving|closed|failed
+        // new|requesting|awaiting-offer|connecting|sending|receiving|closed|failed
+        state: 'new',
         chunks: [],
         received: 0,
         sent: 0,
+        speed: 0,
         lastRxAt: Date.now(),
         lastPaintAt: 0,
         startedAt: 0,
         iceRestarts: 0,
+        routeLabel: '',                                        // '局域网直连' / '公网 P2P 直连'
+        statsProbe: false,
         pendingCandidates: [],
         queue: Promise.resolve(),
         heartbeat: null,
         connectTimer: null,
+        graceTimer: null,
         done: false,
       };
       state.transfers.set(session.id, session);
+      state.activeConnections.set(session.key, session);
       return session;
     }
 
-    function activeTransferForFile(fileId) {
+    function activeSessionsForFile(fileId) {
+      const list = [];
       for (const session of state.transfers.values()) {
-        if (session.fileId === fileId && session.state !== 'closed' && session.state !== 'failed' && !session.done) {
-          return session;
-        }
+        if (session.fileId !== fileId) continue;
+        if (session.state === 'closed' || session.state === 'failed') continue;
+        list.push(session);
+      }
+      return list;
+    }
+
+    /** 我自己作为接收方正在进行的会话：决定卡片按钮是「接收」还是「取消」 */
+    function activeReceiverSession(fileId) {
+      for (const session of state.transfers.values()) {
+        if (session.role !== 'receiver' || session.fileId !== fileId) continue;
+        if (session.state === 'closed' || session.state === 'failed' || session.done) continue;
+        return session;
       }
       return null;
     }
@@ -2507,7 +2637,9 @@
     function activeSenderCount() {
       let count = 0;
       for (const session of state.transfers.values()) {
-        if (session.role === 'sender' && session.state !== 'closed' && session.state !== 'failed' && !session.done) count += 1;
+        if (session.role !== 'sender') continue;
+        if (session.state === 'closed' || session.state === 'failed') continue;
+        count += 1;
       }
       return count;
     }
@@ -2532,7 +2664,7 @@
         });
     }
 
-    /* ---------------- 接收方：发起下载 ---------------- */
+    /* ---------------- 接收方：点「接收」只发一条请求，不建 PC ---------------- */
 
     async function requestDownload(fileId) {
       const card = state.cards.get(fileId);
@@ -2545,19 +2677,31 @@
         return;
       }
 
+      // 防冲突：同一个文件对同一个发送方已经在传 / 在握手，就别再起一条
+      const busy = state.activeConnections.get(connectionKey(target.socketId, fileId));
+      if (busy && busy.state !== 'failed' && busy.state !== 'closed') {
+        toast('这条连接正在建立，请稍候…', 'warn');
+        return;
+      }
+
       const transferId = `t_${randHex(10)}`;
       const session = createSession({
         role: 'receiver',
         transferId,
         fileId,
         peerSocketId: target.socketId,
+        peerName: target.userName,
         fileName: message.file.name,
         size: message.file.size,
         mime: message.file.mime,
+        hash: message.file.hash || '',
+        hashKind: message.file.hashKind || '',
       });
+      session.state = 'requesting';
 
+      setRoute(fileId, '正在握手…', 'active');
       paintCard(fileId, {
-        text: `正在向 ${target.userName} 发起下载请求…`,
+        text: `正在请求 ${target.userName} 建立直连…`,
         tone: 'active',
         progress: null,
         buttonLabel: '取消',
@@ -2565,12 +2709,19 @@
         buttonDisabled: false,
       });
 
-      const result = await emitAck('file:request', { fileId, transferId, to: target.socketId });
+      // 只走 Socket.io：服务器把请求转给发送方，由发送方决定建不建连
+      const result = await emitAck('request_transfer', {
+        fileId,
+        transferId,
+        senderId: target.socketId,
+      });
       if (!result.ok) {
-        failTransfer(session, result.error || 'request_failed', result.message || '无法发起下载');
+        failTransfer(session, result.error || 'request_failed', result.message || '无法发起接收');
         return;
       }
-      await startReceiverPeer(session);
+
+      session.state = 'awaiting-offer';
+      armConnectTimeout(session);
     }
 
     /**
@@ -2582,24 +2733,69 @@
     function resolveSenderSocket(message) {
       const file = message?.file;
       if (!file) return null;
-      const bySocket = state.members.find((m) => m.socketId === file.senderSocketId);
+      const bySocket = state.members.find((member) => member.socketId === file.senderSocketId);
       if (bySocket) return bySocket;
-      return state.members.find((m) => m.userId === message.userId) || null;
+      return state.members.find((member) => member.userId === message.userId) || null;
     }
 
-    async function startReceiverPeer(session) {
+    /* ---------------- 发送方：收到请求才针对这一个接收方建连 ---------------- */
+
+    function handleTransferRequest(payload) {
+      if (!payload || typeof payload !== 'object') return;
+      const { fileId, transferId, receiverId } = payload;
+      const receiver = payload.from || {};
+      if (typeof fileId !== 'string' || typeof transferId !== 'string' || typeof receiverId !== 'string') return;
+
+      const file = state.files.get(fileId);
+      if (!file) {
+        // 发送方刷新过页面，File 对象已经没了
+        sendSignalTo(receiverId, { kind: 'reject', transferId, reason: 'file_unavailable' });
+        toast('原文件已失效（页面刷新过），请重新发送', 'error');
+        return;
+      }
+      if (activeSenderCount() >= MAX_ACTIVE_SENDS) {
+        sendSignalTo(receiverId, { kind: 'reject', transferId, reason: 'busy' });
+        toast('同时进行的传输太多，请稍后再试', 'warn');
+        return;
+      }
+
+      // 防冲突：同一个接收方 + 同一个文件只建一条
+      const key = connectionKey(receiverId, fileId);
+      const existing = state.activeConnections.get(key);
+      if (existing && existing.state !== 'failed' && existing.state !== 'closed') {
+        sendSignalTo(receiverId, { kind: 'reject', transferId, reason: 'duplicate' });
+        return;
+      }
+
+      const session = createSession({
+        role: 'sender',
+        transferId,
+        fileId,
+        peerSocketId: receiverId,
+        peerName: receiver.userName || '对方',
+        fileName: file.name,
+        size: file.size,
+        mime: file.type || '',
+        hash: '',
+        hashKind: '',
+        file,
+      });
+
+      startSenderPeer(session);
+    }
+
+    /** 发送方是 offer 方：为这一个接收方单独创建 PeerConnection + DataChannel */
+    async function startSenderPeer(session) {
       try {
         const pc = new RTCPeerConnection(rtcConfiguration());
         session.pc = pc;
         bindPeerEvents(session);
 
-        // 下载方负责创建 DataChannel，也就意味着它是 offer 方
-        const dc = pc.createDataChannel('burnchat-file', { ordered: true });
+        const dc = pc.createDataChannel('ghostdrop-file', { ordered: true });
         session.dc = dc;
         wireDataChannel(session);
 
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+        await pc.setLocalDescription(await pc.createOffer());
         session.state = 'connecting';
         sendSignal(session, {
           kind: 'offer',
@@ -2608,69 +2804,21 @@
           sdp: pc.localDescription,
         });
 
-        paintCard(session.fileId, {
-          text: '正在通过 STUN 打洞建立连接…',
-          tone: 'active',
-          progress: null,
-          buttonLabel: '取消',
-          buttonHidden: false,
-        });
-
-        session.connectTimer = setTimeout(() => {
-          if (session.state === 'connecting' || session.state === 'new') {
-            failTransfer(session, 'connect_timeout', `${STRICT_NETWORK_HINT}（连接超时）`);
-          }
-        }, CONNECT_TIMEOUT_MS);
+        armConnectTimeout(session);
+        paintSenderCard(session.fileId);
+        setRoute(session.fileId, '正在握手…', 'active');
       } catch (error) {
-        console.error('[receiver] 创建 PeerConnection 失败', error);
+        console.error('[sender] 创建 PeerConnection 失败', error);
         failTransfer(session, 'pc_error', '初始化 WebRTC 失败，请刷新页面重试');
       }
     }
 
-    /* ---------------- 发送方：收到下载请求 ---------------- */
-
-    function handleFileRequest(payload) {
-      if (!payload || typeof payload !== 'object') return;
-      const { fileId, transferId, from } = payload;
-      const file = state.files.get(fileId);
-
-      if (!file) {
-        // 发送方刷新过页面，File 对象已经没了
-        sendSignalTo(from.socketId, { kind: 'reject', transferId, reason: 'file_unavailable' });
-        paintCard(fileId, { text: '原文件已失效，请让对方重新发送', tone: 'error', progress: null });
-        return;
-      }
-      if (activeSenderCount() >= MAX_ACTIVE_SENDS) {
-        sendSignalTo(from.socketId, { kind: 'reject', transferId, reason: 'busy' });
-        toast('同时发送的文件太多，请稍后再试', 'warn');
-        return;
-      }
-
-      const existing = state.transfers.get(transferId);
-      if (existing && existing.state !== 'failed' && existing.state !== 'closed') return;
-
-      const session = createSession({
-        role: 'sender',
-        transferId,
-        fileId,
-        peerSocketId: from.socketId,
-        fileName: file.name,
-        size: file.size,
-        mime: file.type || '',
-        file,
-      });
-      session.state = 'awaiting-offer';
-
-      paintCard(fileId, {
-        text: `${from.userName} 正在下载，等待对方建立连接…`,
-        tone: 'active',
-        progress: 0,
-        buttonHidden: true,
-      });
-
+    function armConnectTimeout(session) {
+      clearTimeout(session.connectTimer);
       session.connectTimer = setTimeout(() => {
-        if (session.state === 'awaiting-offer' || session.state === 'connecting') {
-          failTransfer(session, 'connect_timeout', '对方未能建立 P2P 连接（网络可能受限）');
+        if (session.state === 'closed' || session.state === 'failed' || session.done) return;
+        if (session.state === 'connecting' || session.state === 'awaiting-offer' || session.state === 'requesting') {
+          failTransfer(session, 'connect_timeout', P2P_FAILED_HINT);
         }
       }, CONNECT_TIMEOUT_MS);
     }
@@ -2710,7 +2858,8 @@
             'rejected',
             data.reason === 'busy' ? '对方正忙，请稍后再试'
               : data.reason === 'file_unavailable' ? '对方已丢失原始文件，请让其重新发送'
-                : '对方拒绝了这次传输',
+                : data.reason === 'duplicate' ? '这条连接已经在建立中了'
+                  : '对方拒绝了这次传输',
           );
           break;
         case 'cancel':
@@ -2720,6 +2869,8 @@
           break;
       }
     }
+
+    /* ---------------- PeerConnection 事件 ---------------- */
 
     function bindPeerEvents(session) {
       const pc = session.pc;
@@ -2733,48 +2884,135 @@
         });
       };
 
-      // 需求四.2：监听 iceConnectionState，给出明确提示
       pc.oniceconnectionstatechange = () => {
-        const iceState = pc.iceConnectionState;
         if (session.state === 'closed' || session.state === 'failed') return;
+        const iceState = pc.iceConnectionState;
 
         if (iceState === 'connected' || iceState === 'completed') {
           clearTimeout(session.connectTimer);
+          clearTimeout(session.graceTimer);
           session.lastRxAt = Date.now();
+          reportConnectionType(session);
           return;
         }
+
         if (iceState === 'disconnected') {
-          paintCard(session.fileId, {
-            text: '网络波动，P2P 连接正在尝试重连…',
-            tone: 'warn',
-            progress: null,
-          });
-          return;
-        }
-        if (iceState === 'failed') {
-          // 双方都对称 NAT 时会走到这里：STUN 打得穿是缘分，打不穿只能提示
-          if (session.role === 'receiver' && session.iceRestarts < MAX_ICE_RESTARTS) {
+          // 抖动很常见，先给一个宽限窗口；窗口内自己恢复就继续传
+          setRoute(session.fileId, '连接中断，正在尝试恢复…', 'warn');
+          if (session.role === 'sender' && session.iceRestarts < MAX_ICE_RESTARTS) {
             tryIceRestart(session);
             return;
           }
-          failTransfer(session, 'ice_failed', STRICT_NETWORK_HINT);
+          clearTimeout(session.graceTimer);
+          session.graceTimer = setTimeout(() => {
+            if (session.state === 'closed' || session.state === 'failed' || session.done) return;
+            failTransfer(session, 'disconnected', '传输中断（连接已断开）');
+          }, DISCONNECT_GRACE_MS);
+          return;
+        }
+
+        if (iceState === 'failed') {
+          // 打洞彻底失败：释放连接，不再空等
+          failTransfer(session, 'ice_failed', P2P_FAILED_HINT);
         }
       };
 
       pc.onconnectionstatechange = () => {
-        const connState = pc.connectionState;
         if (session.state === 'closed' || session.state === 'failed') return;
-        if (connState === 'failed') {
-          if (session.role === 'receiver' && session.iceRestarts < MAX_ICE_RESTARTS) {
-            tryIceRestart(session);
-            return;
-          }
-          failTransfer(session, 'ice_failed', STRICT_NETWORK_HINT);
-        }
-        if (connState === 'closed' && session.state !== 'closed') {
-          failTransfer(session, 'closed', 'P2P 连接已关闭');
-        }
+        const connState = pc.connectionState;
+        if (connState === 'failed') failTransfer(session, 'ice_failed', P2P_FAILED_HINT);
+        if (connState === 'closed' && session.state !== 'closed') failTransfer(session, 'closed', '传输中断');
       };
+    }
+
+    /**
+     * 需求二：连接建立后用 getStats() 找到当前生效的 candidate-pair，
+     * 看两端的 candidateType 判断是「局域网 / 公网打洞 / TURN 中继」。
+     * @returns {Promise<{kind: 'lan'|'p2p'|'relay'|'unknown', label: string, selected: boolean}>}
+     */
+    async function describeRoute(pc) {
+      try {
+        const stats = await pc.getStats();
+        let pair = null;
+        let selected = false;
+
+        stats.forEach((report) => {
+          if (!pair && report.type === 'transport' && report.selectedCandidatePairId) {
+            pair = stats.get(report.selectedCandidatePairId) || null;
+            selected = Boolean(pair);
+          }
+        });
+        if (!pair) {
+          // 兼容只给 nominated 不给 selectedCandidatePairId 的实现
+          stats.forEach((report) => {
+            if (report.type !== 'candidate-pair' || report.state !== 'succeeded') return;
+            if (report.selected || report.nominated) {
+              pair = report;
+              selected = Boolean(report.selected);
+            }
+          });
+        }
+        if (!pair) return { kind: 'unknown', label: '连接已建立', selected: false };
+
+        const local = pair.localCandidateId ? stats.get(pair.localCandidateId) : null;
+        const remote = pair.remoteCandidateId ? stats.get(pair.remoteCandidateId) : null;
+        const localType = local?.candidateType || '';
+        const remoteType = remote?.candidateType || '';
+
+        if (localType === 'relay' || remoteType === 'relay') {
+          return { kind: 'relay', label: 'TURN 中继', selected };
+        }
+        if (localType === 'host' && remoteType === 'host') {
+          return { kind: 'lan', label: '局域网直连', selected };
+        }
+        if (localType && remoteType) {
+          return { kind: 'p2p', label: '公网 P2P 直连', selected };
+        }
+        return { kind: 'unknown', label: '连接已建立', selected };
+      } catch (error) {
+        console.debug('[rtc] getStats 读取失败', error?.message);
+        return { kind: 'unknown', label: '连接已建立', selected: false };
+      }
+    }
+
+    /**
+     * 接收方把探测到的路径类型回传给发送方（走 DataChannel 控制消息），
+     * 让同一条连接两端显示同一个结论。
+     */
+    function announceRoute(session) {
+      if (!session.routeLabel) return;
+      if (!session.dc || session.dc.readyState !== 'open') return;
+      try {
+        session.dc.send(JSON.stringify({ type: 'route', kind: session.routeKind || '', label: session.routeLabel }));
+      } catch { /* 回传失败不影响传输 */ }
+    }
+
+    async function reportConnectionType(session) {
+      if (!session.pc) return;
+      if (session.statsProbe) return;
+
+      const info = await describeRoute(session.pc);
+      if (session.state === 'closed' || session.state === 'failed') return;
+
+      // 刚 connected 时可能还停在「只 nominated、未 selected」的中间态，等它稳定再下结论：
+      // 否则两端可能各读到自己那一瞬的配对，一个说局域网、一个说公网
+      const unsettled = info.kind === 'unknown' || !info.selected;
+      if (unsettled && (session.statsTries || 0) < 3) {
+        session.statsTries = (session.statsTries || 0) + 1;
+        setTimeout(() => reportConnectionType(session), 900);
+        return;
+      }
+
+      session.statsProbe = true;
+      session.routeLabel = info.label;
+      session.routeKind = info.kind;
+      if (session.role === 'receiver') {
+        setRoute(session.fileId, info.label, 'ok');
+        announceRoute(session);
+      } else if (!session.routeFromPeer) {
+        paintSenderCard(session.fileId);
+      }
+      console.info('[rtc] 连接类型', info.kind, info.label, info.selected ? 'selected' : 'nominated');
     }
 
     /* ---------------- 协商 ---------------- */
@@ -2784,7 +3022,7 @@
       if (!data.sdp) return;
 
       if (!session.pc) {
-        // 发送方：等对方 offer 到了才创建 PeerConnection
+        // 接收方：只有 offer 到了才建 PC（这一步发生在「点了接收」之后）
         const pc = new RTCPeerConnection(rtcConfiguration());
         session.pc = pc;
         pc.ondatachannel = (event) => {
@@ -2797,22 +3035,21 @@
       const pc = session.pc;
       await pc.setRemoteDescription(data.sdp);
       await flushPendingCandidates(session);
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
+      await pc.setLocalDescription(await pc.createAnswer());
       sendSignal(session, {
         kind: 'answer',
         transferId: session.id,
         sdp: pc.localDescription,
       });
       session.state = 'connecting';
+      armConnectTimeout(session);
+      setRoute(session.fileId, '正在握手…', 'active');
     }
 
     async function acceptAnswer(session, data) {
       if (session.state === 'closed' || session.state === 'failed' || session.done) return;
       if (!session.pc || !data.sdp) return;
-      // 只有"我"还没拿到远端描述时才需要 setRemoteDescription
-      if (session.pc.signalingState === 'stable') return;
+      if (session.pc.signalingState === 'stable') return; // 已经拿到过远端描述
       await session.pc.setRemoteDescription(data.sdp);
       await flushPendingCandidates(session);
     }
@@ -2820,7 +3057,10 @@
     async function acceptCandidate(session, data) {
       if (!data.candidate) return;
       if (session.state === 'closed' || session.state === 'failed') return;
-      if (!session.pc) return;
+      if (!session.pc) {
+        session.pendingCandidates.push(data.candidate);
+        return;
+      }
       if (!session.pc.remoteDescription) {
         session.pendingCandidates.push(data.candidate);
         return;
@@ -2854,29 +3094,43 @@
 
       dc.onopen = () => {
         clearTimeout(session.connectTimer);
+        clearTimeout(session.graceTimer);
         session.lastRxAt = Date.now();
         session.startedAt = Date.now();
         session.state = session.role === 'sender' ? 'sending' : 'receiving';
 
-        paintCard(session.fileId, {
-          text: session.role === 'sender' ? '已建立 P2P 直连，正在发送…' : '已建立 P2P 直连，正在接收…',
-          tone: 'active',
-          progress: 0,
-          buttonLabel: session.role === 'sender' ? undefined : '取消',
-          buttonHidden: session.role === 'sender',
-        });
+        // DataChannel 开了但 getStats 可能还没拿到 pair，这里再探一次
+        reportConnectionType(session);
+
+        // 如果连接类型在 DataChannel 打开之前就探到了（那时还没有通道可回传），
+        // 现在补发一次，保证发送方也能看到同一个结论
+        if (session.role === 'receiver' && session.routeLabel) {
+          announceRoute(session);
+        }
 
         startHeartbeat(session);
-        if (session.role === 'sender') startSending(session);
+
+        if (session.role === 'sender') {
+          paintSenderCard(session.fileId);
+          startSending(session);
+        } else {
+          paintCard(session.fileId, {
+            text: '已建立直连，正在接收…',
+            tone: 'active',
+            progress: 0,
+            buttonLabel: '取消',
+            buttonHidden: false,
+          });
+        }
       };
 
       dc.onclose = () => {
         if (session.done || session.state === 'closed' || session.state === 'failed') return;
-        failTransfer(session, 'closed', 'P2P 连接中断，传输失败');
+        failTransfer(session, 'closed', '传输中断（P2P 连接已关闭）');
       };
 
       dc.onerror = (event) => {
-        // 传输收尾阶段的对端关闭常会附带一次 error 事件，属于拆除噪声，不应报错；
+        // 收尾阶段对端关闭常会附带一次 error 事件，属于拆除噪声，不应报错；
         // 真正的中断由 onclose 统一处理，这里只留一条可诊断的 warn
         if (session.done || session.state === 'closed' || session.state === 'failed') return;
         const detail = event?.error?.message || event?.error?.name || '未知错误';
@@ -2890,7 +3144,7 @@
       };
     }
 
-    /* ---------------- 心跳与 ICE 重启（需求四.3） ---------------- */
+    /* ---------------- 心跳与 ICE 重启 ---------------- */
 
     function startHeartbeat(session) {
       clearInterval(session.heartbeat);
@@ -2911,34 +3165,26 @@
         const idle = Date.now() - session.lastRxAt;
         if (idle <= STALL_TIMEOUT_MS) return;
 
-        if (session.role === 'receiver' && session.iceRestarts < MAX_ICE_RESTARTS) {
+        if (session.role === 'sender' && session.iceRestarts < MAX_ICE_RESTARTS) {
           tryIceRestart(session);
-        } else if (session.role === 'sender') {
-          // 发送方无法主动重协商（offer 方是下载方），只能等对端 ICE 重启
-          paintCard(session.fileId, { text: '链路静默，正在等待对方重连…', tone: 'warn', progress: null });
-        } else {
-          failTransfer(session, 'stalled', '传输长时间无响应，网络环境可能过于严格');
+          return;
         }
+        failTransfer(session, 'stalled', '传输中断（链路长时间无响应）');
       }, HEARTBEAT_MS);
     }
 
+    /** 发送方是 offer 方，所以重协商也由发送方发起（接收方只回 answer） */
     async function tryIceRestart(session) {
-      if (session.role !== 'receiver' || !session.pc) return;
+      if (session.role !== 'sender' || !session.pc) return;
       if (session.iceRestarts >= MAX_ICE_RESTARTS) return;
       if (session.pc.signalingState !== 'stable') return;
 
       session.iceRestarts += 1;
       session.lastRxAt = Date.now(); // 给新一轮打洞留出时间窗口
-      paintCard(session.fileId, {
-        text: `网络波动，正在进行第 ${session.iceRestarts} 次打洞重连…`,
-        tone: 'warn',
-        progress: null,
-      });
 
       try {
         session.pc.restartIce();
-        const offer = await session.pc.createOffer({ iceRestart: true });
-        await session.pc.setLocalDescription(offer);
+        await session.pc.setLocalDescription(await session.pc.createOffer({ iceRestart: true }));
         sendSignal(session, {
           kind: 'offer',
           transferId: session.id,
@@ -2946,9 +3192,10 @@
           iceRestart: true,
           sdp: session.pc.localDescription,
         });
+        setRoute(session.fileId, `网络波动，正在第 ${session.iceRestarts} 次重连…`, 'warn');
       } catch (error) {
         console.error('[rtc] ICE 重启失败', error);
-        failTransfer(session, 'ice_failed', STRICT_NETWORK_HINT);
+        failTransfer(session, 'ice_failed', P2P_FAILED_HINT);
       }
     }
 
@@ -2960,13 +3207,15 @@
       session.sent = 0;
 
       try {
-        // 先发一条控制消息说明文件身份，接收方据此校验
+        // 先发一条控制消息说明文件身份，接收方据此复核（含指纹）
         dc.send(JSON.stringify({
           type: 'meta',
           fileId: session.fileId,
           name: session.fileName,
           size: session.size,
           mime: session.mime,
+          hash: session.hash,
+          hashKind: session.hashKind,
         }));
 
         let offset = 0;
@@ -2993,7 +3242,7 @@
         clearInterval(session.heartbeat);
 
         paintCard(session.fileId, {
-          text: `发送完成 · ${formatBytes(session.size)}`,
+          text: `已发送 · ${formatBytes(session.size)}`,
           tone: 'ok',
           progress: 1,
           buttonHidden: true,
@@ -3004,28 +3253,78 @@
       } catch (error) {
         if (session.state === 'closed' || session.state === 'failed') return;
         console.error('[sender] 发送失败', error);
-        failTransfer(session, 'send_error', `发送中断：${error?.message || '未知错误'}`);
+        failTransfer(session, 'send_error', `传输中断：${error?.message || '未知错误'}`);
       }
     }
 
     function paintProgress(session) {
       const now = Date.now();
+      const done = session.role === 'sender' ? session.sent : session.received;
+      const total = session.size || 1;
+      const elapsed = Math.max(0.2, (now - session.startedAt) / 1000);
+      session.speed = done / elapsed;
+
+      if (session.role === 'sender') {
+        paintSenderCard(session.fileId); // 发送方的卡片可能对应多个接收方，统一聚合
+        return;
+      }
+
       if (now - session.lastPaintAt < 120) return;
       session.lastPaintAt = now;
-
-      const total = session.size || 1;
-      const done = session.role === 'sender' ? session.sent : session.received;
-      const elapsed = Math.max(0.2, (now - session.startedAt) / 1000);
-      const speed = done / elapsed;
-
       paintCard(session.fileId, {
         progress: Math.min(1, done / total),
         tone: 'active',
-        text: `${session.role === 'sender' ? '发送中' : '接收中'} ${formatBytes(done)} / ${formatBytes(total)} · ${formatBytes(speed)}/s`,
+        text: `接收中 ${formatBytes(done)} / ${formatBytes(session.size)} · ${formatBytes(session.speed)}/s`,
       });
     }
 
-    /* ---------------- 接收侧：拼装并触发下载 ---------------- */
+    /**
+     * 发送方的卡片是「一个文件一张」，可能有多个接收方同时在下，
+     * 所以这里画的是聚合状态：几个人、平均进度、合计速率、连接类型。
+     */
+    function paintSenderCard(fileId) {
+      const sessions = activeSessionsForFile(fileId).filter((session) => session.role === 'sender');
+      if (!sessions.length) return;
+
+      const count = sessions.length;
+      const connecting = sessions.filter((s) => s.state === 'connecting').length;
+      const speed = sessions.reduce((sum, s) => sum + (s.speed || 0), 0);
+      const progress = sessions.reduce((sum, s) => sum + (s.size ? Math.min(1, s.sent / s.size) : 0), 0) / count;
+      const routes = [...new Set(sessions.map((s) => s.routeLabel).filter(Boolean))];
+
+      if (count > 1) {
+        paintCard(fileId, {
+          progress,
+          tone: 'active',
+          text: `${count} 人正在接收${speed > 0 ? ` · ${formatBytes(speed)}/s` : ''}`,
+        });
+      } else {
+        const only = sessions[0];
+        paintCard(fileId, {
+          progress: only.state === 'sending' ? progress : null,
+          tone: 'active',
+          text: only.state === 'sending'
+            ? `发送中 ${formatBytes(only.sent)} / ${formatBytes(only.size)} · ${formatBytes(speed)}/s`
+            : `${only.peerName} 正在握手…`,
+        });
+      }
+
+      // 多个接收方可能走不同路径（有的局域网、有的公网），带上条数更诚实
+      if (!routes.length) {
+        setRoute(fileId, connecting ? '正在握手…' : '', connecting ? 'active' : 'idle');
+        return;
+      }
+      const tally = new Map();
+      sessions.forEach((session) => {
+        if (session.routeLabel) tally.set(session.routeLabel, (tally.get(session.routeLabel) || 0) + 1);
+      });
+      const label = [...tally.entries()]
+        .map(([name, n]) => (count > 1 ? `${name} ×${n}` : name))
+        .join(' / ');
+      setRoute(fileId, label, 'ok');
+    }
+
+    /* ---------------- 接收侧：拼装、校验、触发下载 ---------------- */
 
     function onReceiverMessage(session, event) {
       const data = event.data;
@@ -3041,6 +3340,8 @@
           session.fileName = control.name || session.fileName;
           session.size = Number(control.size) || session.size;
           session.mime = control.mime || session.mime;
+          if (control.hash) session.hash = String(control.hash);
+          if (control.hashKind) session.hashKind = String(control.hashKind);
           return;
         }
         if (control.type === 'done') {
@@ -3073,17 +3374,35 @@
         try {
           session.dc.send(JSON.stringify({ type: 'pong', t: control.t }));
         } catch { /* 忽略 */ }
+        return;
+      }
+      // 接收方探测到的路径类型回传过来：同一条连接两端看到的是同一个 pair，
+      // 以接收方的判断为准，免得两个人对着同一个文件看到「局域网」和「公网」两种说法
+      if (control.type === 'route' && typeof control.label === 'string') {
+        session.routeLabel = control.label.slice(0, 24);
+        session.routeFromPeer = true;
+        const info = { lan: '本机同网段', p2p: '公网打洞', relay: 'TURN 中继' };
+        console.info('[rtc] 对端报告的连接类型', info[control.kind] || control.label);
+        paintSenderCard(session.fileId);
       }
     }
 
-    function finalizeDownload(session) {
+    async function finalizeDownload(session) {
       if (session.done) return;
       session.done = true;
       clearInterval(session.heartbeat);
+      clearTimeout(session.graceTimer);
 
       const total = session.received;
       const blob = new Blob(session.chunks, { type: session.mime || 'application/octet-stream' });
       session.chunks = [];
+
+      // 用发送方广播的指纹复核一遍（同一套规则：整份 或 头/中/尾采样）
+      const check = await verifyFingerprint(blob, session.hash);
+      const seconds = Math.max(0.2, (Date.now() - session.startedAt) / 1000);
+
+      // 先释放连接，再触发下载：下载是浏览器自己的事，不需要再占着 P2P 通道
+      closeSession(session);
 
       try {
         const url = URL.createObjectURL(blob);
@@ -3101,18 +3420,43 @@
         toast('浏览器阻止了自动下载，请检查浏览器设置', 'error');
       }
 
-      const seconds = Math.max(0.2, (Date.now() - session.startedAt) / 1000);
+      const speedText = `${formatBytes(total / seconds)}/s`;
       paintCard(session.fileId, {
-        text: `接收完成 · ${formatBytes(total)}（${formatBytes(total / seconds)}/s）`,
+        text: `接收完成 · ${formatBytes(total)} · ${speedText}`,
         tone: 'ok',
         progress: 1,
-        buttonLabel: '再次下载',
+        buttonLabel: '再收一次',
         buttonHidden: false,
         buttonDisabled: false,
       });
-      toast(`已接收 ${session.fileName}（${formatBytes(total)}）`, 'success');
 
-      closeSession(session);
+      // 连接类型 + 指纹校验结果放同一行，别让前者被后者顶掉
+      const routeParts = [];
+      if (session.routeLabel) routeParts.push(session.routeLabel);
+      if (check === 'ok') routeParts.push('指纹一致');
+      if (check === 'mismatch') routeParts.push('指纹不一致');
+      if (routeParts.length) setRoute(session.fileId, routeParts.join(' · '), check === 'mismatch' ? 'error' : 'ok');
+
+      toast(
+        check === 'mismatch'
+          ? `${session.fileName} 已接收，但指纹对不上，请重发`
+          : `已接收 ${session.fileName}（${formatBytes(total)}）`,
+        check === 'mismatch' ? 'error' : 'success',
+      );
+    }
+
+    /**
+     * @returns {Promise<'ok'|'mismatch'|'skipped'>}
+     */
+    async function verifyFingerprint(blob, expected) {
+      if (!expected || !window.crypto?.subtle) return 'skipped';
+      try {
+        const actual = (await fingerprintOf(blob)).hash;
+        if (!actual) return 'skipped';
+        return actual === expected ? 'ok' : 'mismatch';
+      } catch {
+        return 'skipped';
+      }
     }
 
     /* ---------------- 收尾 ---------------- */
@@ -3122,23 +3466,40 @@
       session.state = 'failed';
       clearInterval(session.heartbeat);
       clearTimeout(session.connectTimer);
+      clearTimeout(session.graceTimer);
       teardownPeer(session);
-      state.transfers.delete(session.id);
+      forgetSession(session);
 
       const isReceiver = session.role === 'receiver';
-      paintCard(session.fileId, {
-        text: message,
-        tone: 'error',
-        progress: null,
-        buttonLabel: isReceiver ? '重试' : undefined,
-        buttonHidden: isReceiver ? false : true,
-        buttonDisabled: false,
-      });
+      const others = activeSessionsForFile(session.fileId).filter((s) => s.role === 'sender');
 
-      toast(message, 'error');
-      if (code === 'ice_failed' || code === 'connect_timeout' || code === 'stalled') {
-        toast(STRICT_NETWORK_HINT, 'warn', 6000);
+      if (isReceiver) {
+        paintCard(session.fileId, {
+          text: message,
+          tone: 'error',
+          progress: null,
+          buttonLabel: '重试',
+          buttonHidden: false,
+          buttonDisabled: false,
+        });
+        setRoute(session.fileId, '连接失败', 'error');
+        toast(message, 'error');
+        return;
       }
+
+      // 发送方：还有别的接收方在传的话，卡片继续显示聚合状态，别整张判死
+      if (others.length) {
+        paintSenderCard(session.fileId);
+      } else {
+        paintCard(session.fileId, {
+          text: message,
+          tone: 'error',
+          progress: null,
+          buttonHidden: true,
+        });
+        setRoute(session.fileId, '连接失败', 'error');
+      }
+      if (code !== 'canceled') toast(message, code === 'ice_failed' || code === 'connect_timeout' ? 'warn' : 'error');
     }
 
     function closeSession(session) {
@@ -3146,8 +3507,16 @@
       session.state = 'closed';
       clearInterval(session.heartbeat);
       clearTimeout(session.connectTimer);
+      clearTimeout(session.graceTimer);
       teardownPeer(session);
+      forgetSession(session);
+    }
+
+    function forgetSession(session) {
       state.transfers.delete(session.id);
+      // 只有 Map 里存的还是自己时才删，避免误删后来新建的同键连接
+      const byKey = state.activeConnections.get(session.key);
+      if (byKey === session) state.activeConnections.delete(session.key);
     }
 
     function teardownPeer(session) {
@@ -3170,17 +3539,19 @@
       const fileId = session.fileId;
       closeSession(session);
       paintCard(fileId, {
-        text: '已取消，可重新点击下载',
+        text: '已取消，可重新接收',
         tone: 'idle',
         progress: null,
-        buttonLabel: '下载',
+        buttonLabel: '接收',
         buttonHidden: false,
         buttonDisabled: false,
       });
+      setRoute(fileId, '', 'idle');
     }
 
     function closeAllTransfers() {
       for (const session of [...state.transfers.values()]) closeSession(session);
+      state.activeConnections.clear();
     }
 
     /* ================================================================
@@ -3249,7 +3620,7 @@
         const link = `${window.location.origin}${window.location.pathname}?room=${state.room.id}`;
         try {
           await navigator.clipboard.writeText(link);
-          toast('邀请链接已复制（对方仍需输入暗号）', 'success');
+          toast('邀请链接已复制（对方仍需输入服务口令）', 'success');
         } catch {
           // 非 https 或权限被拒时的兜底
           const helper = el('textarea', 'fixed left-[-9999px] top-0');
@@ -3258,7 +3629,7 @@
           helper.select();
           try {
             document.execCommand('copy');
-            toast('邀请链接已复制（对方仍需输入暗号）', 'success');
+            toast('邀请链接已复制（对方仍需输入服务口令）', 'success');
           } catch {
             toast(`复制失败，请手动分享：${link}`, 'warn', 8000);
           }

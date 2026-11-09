@@ -26,10 +26,11 @@
  *    GET /healthz     健康检查（容器 healthcheck 用）
  *    GET /api/config  {stunUrls: string[]}  前端运行时配置
  *
- *  P2P 文件传输里服务器只有一个职责：**信令中继**。
- *    客户端 A（下载方）  --file:request--> 服务器 --file:request--> 客户端 B（发送方）
- *    双方随后通过 `signal` 事件互换 offer / answer / candidate，
- *    文件字节走 WebRTC DataChannel，**不经过本服务器**。
+ *  P2P 文件传输里服务器只有一个职责：**信令中继**，而且只在被请求时才工作。
+ *    1) 发送方 file:announce 广播一张卡片（文件名 / 大小 / 哈希），此时没有任何 RTCPeerConnection；
+ *    2) 接收方点「下载」 --request_transfer--> 服务器 --request_transfer--> 发送方；
+ *    3) 发送方收到后**只针对这一个接收方**新建 RTCPeerConnection，双方通过 `signal`
+ *       事件互换 offer / answer / candidate，文件字节走 DataChannel，不经过本服务器。
  *    所以这里对 signal 只做「同一个房间内」的路由校验，不解析 SDP 内容。
  *
  *  事件契约（Client -> Server）
@@ -39,15 +40,15 @@
  *    room:leave     {}                                          ack: {ok:true}
  *    message:send   {text}                                      ack: {ok, id}
  *    typing         {isTyping}                                  无 ack
- *    file:announce  {fileId, name, size, mime}                  ack: {ok, id}
- *    file:request   {fileId, transferId, to}                    ack: {ok} | {ok:false, error}
- *    signal         {to, data}                                  无 ack（纯中继）
+ *    file:announce    {fileId, name, size, mime, hash, hashKind} ack: {ok, id}
+ *    request_transfer {fileId, transferId, senderId}            ack: {ok} | {ok:false, error}
+ *    signal           {to, data}                                无 ack（纯中继）
  *
  *  事件契约（Server -> Client）
  *    message:new    Message
  *    room:members   {members: Member[]}
  *    room:notice    {id, kind, text, at}      临时系统提示（不入历史）
- *    file:request   {fileId, transferId, from: Member}
+ *    request_transfer {fileId, transferId, receiverId, receiverName, from: Member}
  *    signal         {from, fromUserId, data}
  *    typing         {userId, userName, isTyping}
  * ============================================================================
@@ -748,6 +749,15 @@ io.on('connection', (socket) => {
 
     const mime = typeof body.mime === 'string' ? body.mime.slice(0, 100) : '';
 
+    /**
+     * 文件指纹：发送方在本地算好再广播，服务器只做格式校验。
+     *   kind = 'sha256'  整份文件的 SHA-256（小文件）
+     *   kind = 'sampled' 头/中/尾各 1MB + 字节数的 SHA-256（大文件，避免整份读进内存）
+     * 接收方拼装完 Blob 后用同样的规则再算一次，对不上就提示校验失败。
+     */
+    const hash = typeof body.hash === 'string' && /^[a-f0-9]{64}$/.test(body.hash) ? body.hash : '';
+    const hashKind = hash && (body.hashKind === 'sampled' ? 'sampled' : 'sha256');
+
     const user = socket.data.user;
     const message = {
       id: randomId('m'),
@@ -755,7 +765,7 @@ io.on('connection', (socket) => {
       userId: user.userId,
       userName: user.userName,
       filtered: false,
-      file: { fileId, name, size, mime, senderSocketId: socket.id },
+      file: { fileId, name, size, mime, hash, hashKind, senderSocketId: socket.id },
       at: Date.now(),
     };
 
@@ -764,29 +774,41 @@ io.on('connection', (socket) => {
     ack({ ok: true, id: message.id });
   });
 
-  /* ---------------- 下载请求：把"有人要下载"转给文件持有者 ---------------- */
-  socket.on('file:request', (payload, rawAck) => {
+  /* ---------------- 传输请求：接收方 -> 发送方（按需建连的第一步） ----------------
+   * 服务端在这条事件里只做三件事：鉴权、确认人还在、确认文件确实是这个人在
+   * 这个房间里广播过的。**绝不碰 WebRTC**——真正的 RTCPeerConnection 由发送方
+   * 收到请求后，针对这一个接收方单独创建。
+   */
+  socket.on('request_transfer', (payload, rawAck) => {
     const ack = safeAck(rawAck);
     const room = currentRoom(socket);
     if (!room) return ack(fail('not_in_room', '你已不在房间中'));
-    if (!allow(socket, 'file_request', 20, 30_000)) {
-      return ack(fail('rate_limited', '下载请求太频繁'));
+    if (!allow(socket, 'request_transfer', 20, 30_000)) {
+      return ack(fail('rate_limited', '接收请求太频繁，请稍后再试'));
     }
 
     const body = payload && typeof payload === 'object' ? payload : {};
     const fileId = typeof body.fileId === 'string' ? body.fileId : '';
     const transferId = typeof body.transferId === 'string' ? body.transferId : '';
-    const to = typeof body.to === 'string' ? body.to : '';
+    const senderId = typeof body.senderId === 'string' ? body.senderId : '';
 
     if (!/^f_[A-Za-z0-9_-]{6,40}$/.test(fileId)) return ack(fail('bad_file_id', '文件标识不合法'));
     if (!/^t_[A-Za-z0-9_-]{6,40}$/.test(transferId)) return ack(fail('bad_transfer_id', '传输标识不合法'));
-    if (!room.members.has(to) || to === socket.id) {
-      return ack(fail('peer_offline', '发送方已离线，无法下载'));
+    if (!senderId || senderId === socket.id) return ack(fail('bad_peer', '发送方标识不合法'));
+    if (!room.members.has(senderId)) return ack(fail('peer_offline', '发送方已离线，无法接收'));
+
+    // 只允许请求「本房间里确实广播过」的文件，避免拿别人的 fileId 乱探
+    const entry = room.messages.find((m) => m.type === 'file' && m.file && m.file.fileId === fileId);
+    if (!entry) return ack(fail('file_expired', '这个文件已不在房间记录里（只保留最近 50 条）'));
+    if (entry.file.senderSocketId && entry.file.senderSocketId !== senderId) {
+      return ack(fail('bad_peer', '文件发送者不匹配'));
     }
 
-    io.to(to).emit('file:request', {
+    io.to(senderId).emit('request_transfer', {
       fileId,
       transferId,
+      receiverId: socket.id,
+      receiverName: socket.data.user.userName,
       from: {
         socketId: socket.id,
         userId: socket.data.user.userId,

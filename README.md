@@ -12,6 +12,10 @@
            └──── WebRTC DataChannel（文件本体，16KB 分片）────┘
 ```
 
+**连接是按需建立的**：进房间时一个 `RTCPeerConnection` 都不会创建；
+只有某个接收方真的点了「接收」，发送方才为**这一个接收方**实例化一条连接，
+传完即拆。一个房间里人再多，空闲时也是零连接。
+
 界面是瑞士国际主义式的极简排版：纯白 / 深空灰两套主题、1px 实线、没有任何
 Emoji 与渐变、没有前端框架与 CDN —— 一个 `index.html` 里同时放着 CSS 和原生 JS。
 
@@ -28,11 +32,13 @@ Emoji 与渐变、没有前端框架与 CDN —— 一个 `index.html` 里同时
 | 双主题 | `:root` 与 `[data-theme="dark"]` 两套 CSS 变量，右上角一个几何按钮切换，`localStorage` 记住选择 |
 | 文本流 | 服务器中转，每房间保留最新 50 条，新成员随加入响应一次性拉取 |
 | 敏感词过滤 | 广播前用 `badWords` 列表替换为 `*`，命中时消息带 `filtered` 标记 |
-| 文件 P2P | 只广播卡片元数据；接收方点「下载」后双方经信令建立 DataChannel，16KB 分片传输 |
+| 文件 P2P | 广播时只带元数据（文件名 / 大小 / 指纹）；接收方点「接收」才由发送方建连，16KB 分片传输，传完即拆 |
+| 连接类型 | 连上后读 `pc.getStats()` 的 candidate-pair，卡片上标「局域网直连 / 公网 P2P 直连 / TURN 中继」，两端显示一致 |
 | 拖拽发送 | 文件拖到窗口任意位置 → 整页虚线覆盖层「释放以发送文件」 |
 | STUN 可配置 | 后端从 `STUN_URLS` 读，通过 `GET /api/config` 下发；前端启动时 fetch 后动态构建 `iceServers`，代码里没有写死任何 STUN |
-| 网络提示 | 监听 `iceConnectionState`，`failed` / `disconnected` 时在卡片和顶部状态栏明确提示 |
-| 传输自愈 | DataChannel 心跳 + 12 秒无进展自动 `restartIce()`，最多 2 次 |
+| 网络提示 | 卡片上依次显示「正在握手…」→ 连接类型；中断时显示「传输中断」并释放连接 |
+| 传输自愈 | DataChannel 心跳 + 12 秒无进展由发送方 `restartIce()`，最多 2 次 |
+| 完整性校验 | 发送方广播 SHA-256（>64MB 取样头/中/尾），接收端拼装后复核，卡片标「指纹一致 / 不一致」 |
 | 在线成员 | 右侧（移动端为抽屉）实时显示房间成员 |
 | 反滥用 | 发言 / 建卡 / 信令 / 建房 / 口令校验的滑动窗口限流，房间数与人数上限 |
 
@@ -136,6 +142,47 @@ npm start                         # 默认 http://127.0.0.1:3000
 > 房间号会被规范化：`A1B2!`、`room_A1B2` 都会变成 `room_a1b2`。
 > 口令只存在页面内存（`state.accessCode`），刷新、重开标签页都要重新输入。
 
+## 按需建连（On-Demand Connection）
+
+文件传输不再「进房即建连」，而是五步走：
+
+| 步骤 | 谁做的 | 发生了什么 |
+| --- | --- | --- |
+| 1 | 进房间 | 只连 Socket.io。**零个 `RTCPeerConnection`** |
+| 2 | 发送方选文件 | 本地算指纹 → `file:announce` 广播卡片（文件名 / 大小 / mime / hash）。仍然不建连 |
+| 3 | 接收方点「接收」 | `request_transfer {fileId, transferId, senderId}` 发给服务端，服务端只做校验与转发，**完全不碰 WebRTC** |
+| 4 | 发送方收到请求 | 为**这一个接收方** `new RTCPeerConnection()` → `createDataChannel` → offer |
+| 5 | 接收方收到 offer | 这时才 `new RTCPeerConnection()`（`ondatachannel` 拿通道）→ answer → 交换 ICE |
+
+服务端 `request_transfer` 的校验顺序：`not_in_room` → 限流 → `bad_file_id` /
+`bad_transfer_id` → `bad_peer` → `peer_offline` → `file_expired`（历史里找不到这张卡片，
+比如已经被 50 条上限挤掉了）。全部通过才转发给发送方，附带 `receiverId` / `receiverName` / `from`。
+
+**防冲突**：本地用一张 `state.activeConnections` 表，键是 `接收方socketId|fileId`。
+接收方连点两下按钮、或者两个人同时点同一个文件，都不会建出第二条 DataChannel ——
+前者在「已有一条正在建立」时直接返回，后者本来就是不同的键（不同接收方各一条）。
+发送方同时最多 `MAX_ACTIVE_SENDS`（3）条对外发送，超出的请求会收到 `busy` 拒绝。
+
+**连接类型判定**：`iceConnectionState === 'connected'` 之后调 `pc.getStats()`，
+优先用 `transport.selectedCandidatePairId` 指向的那一对，回退到 `state === 'succeeded'`
+且 `nominated` 的候选对，再看两端 `candidateType`：
+
+| 组合 | 卡片文案 |
+| --- | --- |
+| host + host | 局域网直连 |
+| 含 relay | TURN 中继 |
+| 其他（host + srflx / srflx + srflx） | 公网 P2P 直连 |
+
+刚连上时 `getStats()` 可能还停在「只 nominated、未 selected」的中间态，
+所以最多重试 3 次（每次 900ms），稳定后才下结论；接收方探到结果后通过
+DataChannel 回传一条 `{type:'route'}` 控制消息，发送方采用同一个结论 ——
+两端看到的说法不会一个说局域网、一个说公网。
+
+**中断处理**：`disconnected` 先给 6 秒宽限并提示「连接中断，正在尝试恢复…」，
+期间发送方尝试 `restartIce()`；宽限结束或状态变成 `failed`，卡片显示「传输中断」，
+`closeSession()` 立刻拆掉 `RTCPeerConnection` 并把它从 `activeConnections` 里删掉。
+中断后按钮回到「重试」，点一下会重新走完整的按需建连流程。
+
 ## 外观与主题
 
 - **两套颜色**：`:root` 是白天（`#fff` 底 / `#101010` 字 / `#e3e3e3` 线），
@@ -174,7 +221,7 @@ proxy_read_timeout 3600s;                          # 别让 60s 默认值掐断�
 默认值是 `stun:stun.l.google.com:19302`，你可以在 `.env` 的 `STUN_URLS` 里换成自建地址。
 
 只配了 STUN（没有 TURN），所以**对称型 NAT / 严格企业防火墙下可能打不通**，
-此时卡片会提示「网络环境严格，P2P 连接失败」。需要更高成功率时，
+此时卡片会提示「P2P 连接失败，请确保网络通畅」。需要更高成功率时，
 除了把 TURN 地址写进 `STUN_URLS`，还要带上凭据 —— 那种情况建议扩展
 `/api/config` 的返回结构（例如 `iceServers` 直接返回带 `username` / `credential` 的对象），
 并且**给这个接口加鉴权**，否则长期凭据会随页面发给任何人：
@@ -193,6 +240,12 @@ STUN/TURN 走 UDP，和 Nginx 无关，需要在防火墙放行对应端口。
   （刷新才重新 fetch `/api/config`）。
 - **单进程内存**：不支持多副本水平扩展（多实例之间房间不共享）。要横向扩展需接
   Socket.io Redis adapter 并额外解决信令路由。
+- **同一文件同一接收方只允许一条连接**：重复点「接收」会被 `activeConnections` 挡掉，
+  必须等这条断掉（或点「取消」）才能重新发起。
+- **连接类型是探测结果**：以接收方那一端的 `getStats()` 为准，再回传给发送方；
+  只配 STUN 时无法区分「打洞」和「中继失败回退」，属于尽力而为的判断。
+- **大文件指纹是采样值**：超过 64MB 只对头 / 中 / 尾各 1MB 做 SHA-256，卡片上照样标记，
+  但严格来说不是整份校验。
 - **文件上限 1GB**：接收端要在浏览器内存里拼装 Blob，超过这个量级容易 OOM。
 - **同一浏览器多标签**：共用 `localStorage` 里的 `userId`，会被识别为同一用户。
 - **刷新即重连**：刷新会短暂断开，而且口令要重输；如果你是最后一人，房间已被焚毁，
@@ -205,9 +258,13 @@ STUN/TURN 走 UDP，和 Nginx 无关，需要在防火墙放行对应端口。
 | --- | --- |
 | ![](screenshots/home-light.png) | ![](screenshots/home-dark.png) |
 
-| 聊天 + P2P 文件卡片（白天） | 聊天 + P2P 文件卡片（黑夜） |
+| 按需建连完成（白天） | 按需建连完成（黑夜） |
 | --- | --- |
-| ![](screenshots/chat-light.png) | ![](screenshots/chat-dark.png) |
+| ![](screenshots/on-demand-light.png) | ![](screenshots/on-demand-dark.png) |
+
+| 一个文件两个接收方 | 聊天 + P2P 文件卡片（白天） |
+| --- | --- |
+| ![](screenshots/on-demand-multi.png) | ![](screenshots/chat-light.png) |
 
 | 手机端 | 手机端成员抽屉 |
 | --- | --- |
